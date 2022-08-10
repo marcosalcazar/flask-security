@@ -867,6 +867,7 @@ def two_factor_setup():
                 session["tf_totp_secret"], user
             )
             # Add all the values used in qrcode to json response
+            json_response["tf_authr_qrcode"] = authr_setup_values["image"]
             json_response["tf_authr_key"] = authr_setup_values["key"]
             json_response["tf_authr_username"] = authr_setup_values["username"]
             json_response["tf_authr_issuer"] = authr_setup_values["issuer"]
