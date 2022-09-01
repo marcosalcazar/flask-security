@@ -20,6 +20,7 @@ import typing as t
 from urllib.parse import parse_qsl, parse_qs, urlsplit, urlunsplit, urlencode
 import urllib.request
 import urllib.error
+import warnings
 
 from flask import (
     after_this_request,
@@ -31,7 +32,6 @@ from flask import (
     session,
     url_for,
 )
-from flask.json import JSONEncoder
 from flask_login import login_user as _login_user
 from flask_login import logout_user as _logout_user
 from flask_login import current_user
@@ -711,7 +711,13 @@ def get_token_status(token, serializer, max_age=None, return_data=False):
     :param max_age: The name of the max age config option. Can be one of
                     the following: ``CONFIRM_EMAIL``, ``LOGIN``,
                     ``RESET_PASSWORD``
+
+    .. deprecated:: 5.0.0
     """
+    warnings.warn(
+        "'get_token_status' is deprecated - use check_and_get_token_status instead",
+        DeprecationWarning,
+    )
     serializer = getattr(_security, serializer + "_serializer")
     max_age = get_max_age(max_age)
     user, data = None, None
@@ -797,9 +803,10 @@ def get_identity_attribute(
 
 def lookup_identity(identity):
     """
-    Validate identity - we go in order to figure out which user attribute the
-    request gave us. Note that we give up on the first 'match' even if that
-    doesn't yield a user. Why?
+    Lookup identity in DB.
+    This loops through, in order, SECURITY_USER_IDENTITY_ATTRIBUTES, and first
+    calls the mapper function to validate/normalize. Then the db.find_user is called
+    on the specified user model attribute.
     """
     for mapping in config_value("USER_IDENTITY_ATTRIBUTES"):
         attr = list(mapping.keys())[0]
@@ -1049,22 +1056,6 @@ def json_error_response(
     response_json["errors"] = plain_errors
 
     return response_json
-
-
-class FsJsonEncoder(JSONEncoder):
-    """Flask-Security JSON encoder.
-    Extends Flask's JSONencoder to handle lazy-text.
-
-    .. versionadded:: 3.3.0
-    """
-
-    def default(self, obj):
-        from .babel import is_lazy_string
-
-        if is_lazy_string(obj):
-            return str(obj)
-        else:
-            return JSONEncoder.default(self, obj)
 
 
 def default_render_template(*args, **kwargs):

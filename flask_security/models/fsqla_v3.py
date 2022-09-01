@@ -11,6 +11,9 @@ a new version needs to be created.
 This is Version 3:
     - Add support for webauthn.
     - Add support for 2FA recovery codes.
+    - password can be null.
+    - us_phone_number must be unique.
+    - Add support for list types.
 """
 
 from sqlalchemy import (
@@ -80,7 +83,7 @@ class FsUserMixin(FsUserMixinV2):
 
     # The user handle as required during registration.
     # Note max length 64 as specified in spec.
-    fs_webauthn_user_handle = Column(String(64), unique=True)
+    fs_webauthn_user_handle = Column(String(64), unique=True, nullable=True)
 
     # MFA - one time recovery codes - comma separated.
     mf_recovery_codes = Column(MutableList.as_mutable(AsaList()), nullable=True)
@@ -88,6 +91,9 @@ class FsUserMixin(FsUserMixinV2):
     # Change password to nullable so we can tell after registration whether
     # a user has a password or not.
     password = Column(String(255), nullable=True)
+
+    # since phone can be used to authenticate - must be unique.
+    us_phone_number = Column(String(128), nullable=True, unique=True)
 
     # This is repeated since I couldn't figure out how to have it reference the
     # new version of FsModels.

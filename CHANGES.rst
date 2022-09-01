@@ -6,9 +6,9 @@ Here you can see the full list of changes between each Flask-Security release.
 Version 5.0.0
 -------------
 
-Released TBD
+Released August 27. 2022
 
-**PLEASE READ CHANGE NOTES CAREFULLY - THERE ARE LIKELY REQUIRED CHANGES YOU WILL HAVE TO MAKE**
+**PLEASE READ CHANGE NOTES CAREFULLY - THERE ARE LIKELY REQUIRED CHANGES YOU WILL HAVE TO MAKE.**
 
 Features
 ++++++++
@@ -16,17 +16,36 @@ Features
 - (:issue:`479`) Support Two-factor recovery codes.
 - (:issue:`585`) Provide option to prevent user enumeration (i.e. Generic Responses).
 - (:pr:`532`) Support for Python 3.10.
+- (:pr:`657`, :pr:`655`) Support for Flask >= 2.2.
 - (:pr:`540`) Improve Templates in support of JS required by WebAuthn.
-- (:pr:`568`) Deprecate the old passwordless feature in favor of Unified Signin.
-- (:pr:`568`) Deprecate replacing login_manager so we can possibly vendor that in in the future.
 - (:pr:`608`) Add Icelandic translations. (ofurkusi)
+- (:pr:`650`) Update German translations. (sr-verde)
 - (:issue:`256`) Add custom HTML attributes to improve user experience.
   This changed LoginForm quite a bit - please see backwards compatability concerns
   below. The default LoginForm and template should be the same as before.
 - (:pr:`638`) The JSON errors response has been unified. Please see backwards
   compatibility concerns below.
-- (:pr:`xxx`) The previously deprecated methods RoleMixin.add_permissions and
+- Updated all-inclusive data models (fsqla_v3). Add fields necessary for the new WebAuthn and
+  Two-Factor recovery codes features.
+  Changed `us_phone_number` to be unique (but not required). Changed `password` to be nullable.
+
+Deprecations
+++++++++++++
+- (:pr:`568`) Deprecate the old passwordless feature in favor of Unified Signin.
+- (:pr:`568`) Deprecate replacing login_manager so we can possibly vendor that in in the future.
+- (:pr:`654`) The previously deprecated methods RoleMixin.add_permissions and
   RoleMixin.remove_permissions have been removed.
+- (:pr:`657`) The ability to pass in a json_encoder_cls as part of initialization has been removed
+  since Flask 2.2 has deprecated and replaced that functionality.
+- (:pr:`655`) Flask has deprecated @before_first_request. This was used mostly in examples/quickstart.
+  These have been changed to use app.app_context() prior to running the app. FS itself used it in
+  2 places - to populate `_` in jinja globals if Babel wasn't initialized and to perform
+  various configuration sanity checks w.r.t. WTF CSRF. All FS templates have been converted
+  to use `_fsdomain` rather than ``_`` so FS no longer will populate ``_``. The configuration checks
+  have been moved to the end of Security::init_app() - so it is now imperative that `FlaskWTF::CSRFProtect()`
+  be called PRIOR to initializing Flask-Security.
+- encrypt_password method has been removed. It has been deprecated since 2.0.2
+- get_token_status has been deprecated.
 
 Fixes
 +++++
@@ -45,13 +64,8 @@ Fixes
   has been added (defaults to ``True``).
 - (:issue:`479`) A new configuration option :py:data:`SECURITY_TWO_FACTOR_RESCUE_EMAIL` has been added
   that allows disabling that feature - defaults to backwards compatible ``True``
-- (:pr:`xxx`) Flask has deprecated @before_first_request. This was used mostly in examples/quickstart.
-  These have been changed to use app.app_context() prior to running the app. FS itself used it in
-  2 places - to populate `_` in jinja globals if Babel wasn't initialized and to perform
-  various configuration sanity checks w.r.t. WTF CSRF. All FS templates have been converted
-  to use `_fsdomain` rather than ``_`` so FS no longer will populate ``_``. The configuration checks
-  have been moved to the end of Security::init_app() - so it is now imperative that `FlaskWTF::CSRFProtect()`
-  be called PRIOR to initializing Flask-Security.
+- (:issue:`658`) us_phone_number needs to be validated to be unique.
+
 
 Backward Compatibility Concerns
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -76,6 +90,8 @@ For unified signin:
   variable ``SECURITY_PASSWORD_REQUIRED`` must be set to False.
 - ``SECURITY_US_VERIFY_SEND_CODE_URL`` and ``SECURITY_US_SIGNIN_SEND_CODE_URL`` used to send ``code_sent`` to the template.
   Now they flash the ``SECURITY_MSG_CODE_HAS_BEEN_SENT`` message.
+- With the addition of being able to delete a previously setup up sign in method, the signal `us_profile_changed` arguments
+  have changed. `method` is now `methods` and is a list, and a new argument `delete` is True if a sign in option was deleted.
 
 Login:
 
@@ -98,7 +114,6 @@ Other:
 - Some fields have custom HTML attributes attached to them (e.g. autocomplete, type, etc). These are stored as part of the
   form in the ``render_kw`` attribute. This could cause some confusion if an app had its own templates and set different
   attributes.
-- encrypt_password method has been removed. It has been deprecated since 2.0.2
 - The keys for "/tf-rescue" select options have changed to be more 'action' oriented:
 
     - `lost_device` -> `email`
@@ -112,8 +127,10 @@ Other:
   related JSON responses.
 - Permissions - The Role Model now stores permissions as a list, and requires that the underlying DB ORM map that to a supported
   DB type. For SQLAlchemy, this is mapped to a comma separated string (as before). For Mongo, a ListField can be directly used. For
-  for SQLAlchemy DBs the Column type (UnicodeText) didn't change so no data migration should be required.
+  SQLAlchemy DBs the Column type (UnicodeText) didn't change so no data migration should be required.
 - CSRF - As mentioned above, it is now required that `FlaskWTF::CSRFProtect()`, if used, must be called PRIOR to initializing Flask-Security.
+- json_encoder_cls - As mentioned above - Flask-Security initialization on longer accepts overriding the json_encoder class. If this is required,
+  update to Flask >=2.2 and implement Flask's JSONProvider interface.
 
 For templates:
 
@@ -130,7 +147,7 @@ To ease updates - Flask-Security will automatically create a fs_webauthn_user_ha
 upon first use for existing users.
 If you are using Alembic the schema migration is easy::
 
-    op.add_column('user', sa.Column('fs_webauthn_user_handle', sa.String(length=64), nullable=True))
+    op.add_column('user', sa.Column('fs_webauthn_user_handle', sa.String(length=64), nullable=True, unique=True))
 
 
 If you want to allow for empty passwords as part of registration then set :py:data:`SECURITY_PASSWORD_REQUIRED` to ``False``.
