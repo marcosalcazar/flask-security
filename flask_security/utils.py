@@ -498,6 +498,8 @@ def url_for_security(endpoint: str, **values: t.Union[str, bool]) -> str:
     :param _method: if provided this explicitly specifies an HTTP method.
     """
     endpoint = get_security_endpoint_name(endpoint)
+    if custom_endpoint := current_app.config.get('SECURITY_VIEWS', {}).get(endpoint):
+        endpoint = custom_endpoint
     # mypy is complaining about this - but I think it's wrong?
     return url_for(endpoint, **values)  # type: ignore
 
