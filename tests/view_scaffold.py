@@ -47,9 +47,6 @@ from flask_security.signals import (
 )
 from flask_security.utils import hash_password, uia_email_mapper, uia_phone_mapper
 
-if t.TYPE_CHECKING:  # pragma: no cover
-    from flask_security.datastore import User
-
 
 def _find_bool(v):
     if str(v).lower() in ["true"]:
@@ -68,7 +65,6 @@ class FlashMailUtil(MailUtil):
         sender: t.Union[str, tuple],
         body: str,
         html: t.Optional[str],
-        user: "User",
         **kwargs: t.Any,
     ) -> None:
         flash(f"Email body: {body}")
@@ -79,9 +75,7 @@ SET_LANG = False
 
 def create_app():
     # Use real templates - not test templates...
-    app = Flask(
-        "view_scaffold", template_folder="../", static_folder="../flask_security/static"
-    )
+    app = Flask("view_scaffold", template_folder="../")
     app.config["DEBUG"] = True
     # SECRET_KEY generated using: secrets.token_urlsafe()
     app.config["SECRET_KEY"] = "pf9Wkove4IKEAXvy-cQkeDPhv9Cb3Ag-wyJILbq_dFw"
@@ -91,7 +85,9 @@ def create_app():
     app.config["LOGIN_DISABLED"] = False
     app.config["WTF_CSRF_ENABLED"] = True
     app.config["REMEMBER_COOKIE_SAMESITE"] = "strict"
-    app.config["SESSION_COOKIE_SAMESITE"] = "strict"
+    # 'strict' causes redirect after oauth to fail since session cookie not sent
+    # this just happens on first 'register' with e.g. github
+    # app.config["SESSION_COOKIE_SAMESITE"] = "strict"
     app.config["SECURITY_USER_IDENTITY_ATTRIBUTES"] = [
         {"email": {"mapper": uia_email_mapper, "case_insensitive": True}},
         {"us_phone_number": {"mapper": uia_phone_mapper}},
@@ -107,9 +103,13 @@ def create_app():
     app.config["SECURITY_FRESHNESS"] = datetime.timedelta(minutes=1)
     app.config["SECURITY_FRESHNESS_GRACE_PERIOD"] = datetime.timedelta(minutes=2)
     app.config["SECURITY_USERNAME_ENABLE"] = True
+    app.config["SECURITY_USERNAME_REQUIRED"] = True
     app.config["SECURITY_PASSWORD_REQUIRED"] = True
-    app.config["SECURITY_MULTI_FACTOR_RECOVERY_CODES"] = True
-    app.config["SECURITY_RETURN_GENERIC_RESPONSES"] = True
+    app.config["SECURITY_RETURN_GENERIC_RESPONSES"] = False
+    # enable oauth - note that this assumes that app is passes XXX_CLIENT_ID and
+    # XXX_CLIENT_SECRET as environment variables.
+    app.config["SECURITY_OAUTH_ENABLE"] = True
+    # app.config["SECURITY_URL_PREFIX"] = "/fs"
 
     class TestWebauthnUtil(WebauthnUtil):
         def generate_challenge(self, nbytes: t.Optional[int] = None) -> str:
@@ -136,15 +136,20 @@ def create_app():
         "two_factor",
         "unified_signin",
         "webauthn",
+        "multi_factor_recovery_codes",
     ]:
         app.config["SECURITY_" + opt.upper()] = True
 
     if os.environ.get("SETTINGS"):
         # Load settings from a file pointed to by SETTINGS
         app.config.from_envvar("SETTINGS")
-    # Allow any SECURITY_ config to be set in environment.
+    # Allow any SECURITY_, SQLALCHEMY, Authlib config to be set in environment.
     for ev in os.environ:
-        if ev.startswith("SECURITY_") or ev.startswith("SQLALCHEMY_"):
+        if (
+            ev.startswith("SECURITY_")
+            or ev.startswith("SQLALCHEMY_")
+            or "_CLIENT_" in ev
+        ):
             app.config[ev] = _find_bool(os.environ.get(ev))
 
     # Create database models and hook up.
@@ -184,7 +189,6 @@ def create_app():
 
     if babel:
 
-        @babel.localeselector
         def get_locale():
             # For a given session - set lang based on first request.
             # Honor explicit url request first
@@ -201,6 +205,8 @@ def create_app():
                 if locale:
                     session["lang"] = locale
             return session.get("lang", None).replace("-", "_")
+
+        babel.locale_selector = get_locale
 
     @app.after_request
     def allow_absolute_redirect(r):

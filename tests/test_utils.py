@@ -14,7 +14,7 @@ import typing as t
 from flask.json.tag import TaggedJSONSerializer
 from flask.signals import message_flashed
 
-from flask_security import Security, SmsSenderBaseClass
+from flask_security import Security, SmsSenderBaseClass, SmsSenderFactory, UserMixin
 from flask_security.datastore import (
     SQLAlchemyUserDatastore,
     SQLAlchemySessionUserDatastore,
@@ -22,7 +22,9 @@ from flask_security.datastore import (
 from flask_security.signals import (
     login_instructions_sent,
     reset_password_instructions_sent,
+    tf_security_token_sent,
     user_registered,
+    us_security_token_sent,
 )
 from flask_security.utils import hash_data, hash_password
 
@@ -75,6 +77,15 @@ def json_logout(client, token, endpoint=None):
     )
 
 
+def get_csrf_token(client):
+    response = client.get(
+        "/login",
+        data={},
+        headers={"Accept": "application/json"},
+    )
+    return response.json["response"]["csrf_token"]
+
+
 def get_session(response):
     """Return session cookie contents.
     This a base64 encoded json.
@@ -92,6 +103,22 @@ def get_session(response):
                 )
                 val = serializer.loads_unsafe(encoded_cookie)
                 return val[1]
+
+
+def setup_tf_sms(client, url_prefix=None):
+    # Simple setup of SMS as a second factor and return the sender so caller
+    # can get codes.
+    SmsSenderFactory.senders["test"] = SmsTestSender
+    sms_sender = SmsSenderFactory.createSender("test")
+    data = dict(setup="sms", phone="+442083661188")
+    response = client.post("/".join(filter(None, (url_prefix, "tf-setup"))), json=data)
+    assert sms_sender.get_count() == 1
+    code = sms_sender.messages[0].split()[-1]
+    response = client.post(
+        "/".join(filter(None, (url_prefix, "tf-validate"))), json=dict(code=code)
+    )
+    assert response.status_code == 200
+    return sms_sender
 
 
 def get_existing_session(client):
@@ -113,6 +140,17 @@ def reset_fresh(client, within):
         sess["fs_paa"] = old_paa
         sess.pop("fs_gexp", None)
     return old_paa
+
+
+def get_form_action(response, ordinal=0):
+    # Return the URL that the form WOULD post to - this is useful to check
+    # how our templates actually work (e.g. propagation of 'next')
+    matcher = re.findall(
+        r'(?:<form action|formaction)="(\S*)"',
+        response.data.decode("utf-8"),
+        re.IGNORECASE | re.DOTALL,
+    )
+    return matcher[ordinal]
 
 
 def check_xlation(app, locale):
@@ -201,9 +239,14 @@ def get_num_queries(datastore):
     return None if datastore doesn't support this.
     """
     if is_sqlalchemy(datastore):
-        from flask_sqlalchemy import get_debug_queries
+        try:
+            # Flask-SQLAlachemy >= 3.0.0
+            from flask_sqlalchemy.record_queries import get_recorded_queries
+        except ImportError:
+            # Flask-SQLAlchemy < 3.0.0
+            from flask_sqlalchemy import get_debug_queries as get_recorded_queries
 
-        return len(get_debug_queries())
+        return len(get_recorded_queries())
     return None
 
 
@@ -304,6 +347,27 @@ def capture_flashes():
         yield flashes
     finally:
         message_flashed.disconnect(_on)
+
+
+@contextmanager
+def capture_send_code_requests():
+    # Easy way to get token/code required for code logins
+    # either second factor or us_signin
+    login_requests = []
+
+    def _on(app, **data):
+        assert all(v in data for v in ["user", "method", "login_token"])
+        assert isinstance(data["user"], UserMixin)
+        login_requests.append(data)
+
+    us_security_token_sent.connect(_on)
+    tf_security_token_sent.connect(_on)
+
+    try:
+        yield login_requests
+    finally:
+        us_security_token_sent.disconnect(_on)
+        tf_security_token_sent.disconnect(_on)
 
 
 def get_auth_token_version_3x(app, user):

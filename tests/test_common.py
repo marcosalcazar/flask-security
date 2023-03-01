@@ -21,6 +21,7 @@ from flask_security import uia_email_mapper
 from tests.test_utils import (
     authenticate,
     get_auth_token_version_3x,
+    get_form_action,
     get_num_queries,
     hash_password,
     json_authenticate,
@@ -72,6 +73,19 @@ def test_authenticate_with_invalid_malformed_next(client, get_message):
     data = dict(email="matt@lp.com", password="password")
     response = client.post("/login?next=http:///google.com", data=data)
     assert get_message("INVALID_REDIRECT") in response.data
+
+
+def test_login_template_next(client):
+    # Test that our login template propagates next.
+    response = client.get("/profile", follow_redirects=True)
+    assert "?next=%2Fprofile" in response.request.url
+    login_url = get_form_action(response)
+    response = client.post(
+        login_url,
+        data=dict(email="matt@lp.com", password="password"),
+        follow_redirects=True,
+    )
+    assert b"Profile Page" in response.data
 
 
 def test_authenticate_with_subdomain_next(app, client, get_message):
@@ -164,6 +178,16 @@ def test_login_form_username(client):
     assert re.search(b'<input[^>]*type="email"[^>]*>', response.data)
     assert re.search(b'<input[^>]*autocomplete="username"[^>]*>', response.data)
     assert re.search(b'<input[^>]*autocomplete="current-password"[^>]*>', response.data)
+
+
+@pytest.mark.settings(username_enable=True, username_required=True)
+def test_login_form_username_required(client):
+    # If username required - we should still be able to login with email alone
+    # given default user_identity_attributes
+    response = client.post(
+        "/login", data=dict(email="matt@lp.com", password="password")
+    )
+    assert response.location == "/"
 
 
 @pytest.mark.confirmable()
@@ -850,6 +874,8 @@ def test_verifying_token_from_version_3x(in_app_context):
 
 
 def test_change_token_uniquifier(app):
+    pytest.importorskip("sqlalchemy")
+
     # make sure that existing token no longer works once we change the token uniquifier
     from sqlalchemy import Column, String
     from flask_sqlalchemy import SQLAlchemy
@@ -901,6 +927,8 @@ def test_change_token_uniquifier(app):
 
 
 def test_null_token_uniquifier(app):
+    pytest.importorskip("sqlalchemy")
+
     # If existing record has a null fs_token_uniquifier, should be set on first use.
     from sqlalchemy import Column, String
     from flask_sqlalchemy import SQLAlchemy
@@ -1018,7 +1046,6 @@ def test_auth_token_decorator(in_app_context):
     client_nc = app.test_client(use_cookies=False)
 
     with app.test_request_context("/"):
-
         user = app.security.datastore.find_user(email="matt@lp.com")
         token = get_auth_token_version_3x(app, user)
 

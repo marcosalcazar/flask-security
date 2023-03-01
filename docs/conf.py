@@ -49,7 +49,7 @@ master_doc = "index"
 
 # General information about the project.
 project = "Flask-Security"
-copyright = "2012-2022"
+copyright = "2012-2023"
 author = "Matt Wright & Chris Wagner"
 
 # The version info for the project you're documenting, acts as replacement for
@@ -57,7 +57,7 @@ author = "Matt Wright & Chris Wagner"
 # built documents.
 #
 # The short X.Y version.
-version = "5.0.0"
+version = "5.1.1"
 # The full version, including alpha/beta/rc tags.
 release = version
 
@@ -104,6 +104,8 @@ nitpick_ignore = [
     ("py:class", "function"),
     ("py:class", "AuthenticatorSelectionCriteria"),
     ("py:class", "UserVerificationRequirement"),
+    ("py:class", "OAuth"),
+    ("py:class", "authlib.integrations.flask_client.OAuth"),
 ]
 autodoc_typehints = "description"
 # autodoc_mock_imports = ["flask_sqlalchemy"]
@@ -140,6 +142,10 @@ html_context = {
         ProjectLink(
             "Issue Tracker",
             "https://github.com/Flask-Middleware/flask-security/issues/",
+        ),
+        ProjectLink(
+            "Changes",
+            "https://flask-security-too.readthedocs.io/en/stable/changelog.html",
         ),
     ]
 }

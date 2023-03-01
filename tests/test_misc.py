@@ -5,7 +5,7 @@
     Lots of tests
 
     :copyright: (c) 2012 by Matt Wright.
-    :copyright: (c) 2019-2022 by J. Christopher Wagner (jwag).
+    :copyright: (c) 2019-2023 by J. Christopher Wagner (jwag).
     :license: MIT, see LICENSE for more details.
 """
 
@@ -28,6 +28,7 @@ from tests.test_utils import (
     capture_flashes,
     capture_reset_password_requests,
     check_xlation,
+    get_csrf_token,
     init_app_with_options,
     json_authenticate,
     logout,
@@ -396,6 +397,109 @@ def test_custom_forms_via_config(app, sqlalchemy_datastore):
     assert b"My Register Email Address Field" in response.data
 
 
+def test_custom_form_instantiator(app, client, get_message):
+    # Test application form instantiation.
+    # This is using the form factory pattern.
+    # Note in this case - Flask-Security doesn't even know the form class name.
+    from flask_security import FormInfo
+
+    class FormInstantiator:
+        def __init__(self, myservice):
+            self.myservice = myservice
+
+        def instantiator(self, form_name, form_cls, *args, **kwargs):
+            if form_name == "login_form":
+                return MyLoginForm(*args, service=self.myservice, **kwargs)
+            raise ValueError("Unknown Form")
+
+    class MyLoginForm(LoginForm):
+        def __init__(self, *args, service=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.myservice = service
+
+        def validate(self, **kwargs: t.Any) -> bool:
+            if not super().validate(**kwargs):  # pragma: no cover
+                return False
+            if not self.myservice(self.email.data):
+                self.email.errors.append("Not happening")
+                return False
+            return True
+
+    def login_checker(email):
+        return True if email == "matt@lp.com" else False
+
+    fi = FormInstantiator(login_checker)
+    app.security.set_form_info("login_form", FormInfo(fi.instantiator))
+
+    response = authenticate(client, follow_redirects=True)
+    assert b"Welcome matt@lp.com" in response.data
+    logout(client)
+
+    # Try a normally legit user - but our service denies it
+    response = authenticate(client, email="joe@lp.com")
+    assert b"Not happening" in response.data
+
+
+def test_custom_form_instantiator2(app, client, get_message):
+    # Test application form instantiation.
+    # This is using the form clone pattern.
+    # Note in this case - Flask-Security doesn't even know the form class name.
+    app.config["WTF_CSRF_ENABLED"] = True
+    from flask_security import FormInfo
+
+    class MyLoginForm(LoginForm):
+        def __init__(self, *args, service=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.myservice = service
+
+        def instantiator(self, form_name, form_cls, *args, **kwargs):
+            return MyLoginForm(*args, service=self.myservice, **kwargs)
+
+        def validate(self, **kwargs: t.Any) -> bool:
+            if not super().validate(**kwargs):  # pragma: no cover
+                return False
+            if not self.myservice(self.email.data):
+                self.email.errors.append("Not happening")
+                return False
+            return True
+
+    def login_checker(email):
+        return True if email == "matt@lp.com" else False
+
+    with app.test_request_context():
+        fi = MyLoginForm(formdata=None, service=login_checker)
+    app.security.set_form_info("login_form", FormInfo(fi.instantiator))
+
+    csrf_token = get_csrf_token(client)
+    response = client.post(
+        "/login",
+        data=dict(email="matt@lp.com", password="password", csrf_token=csrf_token),
+        follow_redirects=True,
+    )
+    assert b"Welcome matt@lp.com" in response.data
+    logout(client)
+
+    # Try a normally legit user - but our service denies it
+    csrf_token = get_csrf_token(client)
+    response = client.post(
+        "/login",
+        data=dict(email="joe@lp.com", password="password", csrf_token=csrf_token),
+    )
+    assert b"Not happening" in response.data
+
+
+def test_custom_form_setting(app, sqlalchemy_datastore):
+    from flask_security import FormInfo
+
+    security = Security(app=app, datastore=sqlalchemy_datastore)
+    with pytest.raises(ValueError) as vex:
+        security.set_form_info("mylogin_form", FormInfo())
+    assert "Unknown form name mylogin_form" == str(vex.value)
+    with pytest.raises(ValueError) as vex:
+        security.set_form_info("login_form", FormInfo())
+    assert "form class must be provided" in str(vex.value)
+
+
 def test_form_required(app, sqlalchemy_datastore):
     class MyLoginForm(LoginForm):
         myfield = StringField("My Custom Field", validators=[Required()])
@@ -487,9 +591,35 @@ def test_sender_tuple(app, sqlalchemy_datastore):
         assert outbox[0].from_email == "Test User <test@testme.com>"
 
 
+def test_send_mail_context(app, sqlalchemy_datastore):
+    """Test full context sent to MailUtil/send_mail"""
+    app.config["MAIL_DEFAULT_SENDER"] = "test@testme.com"
+    app.security = Security()
+    app.security.init_app(app, sqlalchemy_datastore)
+
+    class TestUser:
+        def __init__(self, email):
+            self.email = email
+
+    @app.security.mail_context_processor
+    def mail():
+        return {"foo": "bar-mail"}
+
+    with app.app_context():
+        user = TestUser("matt@lp.com")
+        send_mail("Test Default Sender", user.email, "welcome", user=user)
+        outbox = app.mail.outbox
+        assert 1 == len(outbox)
+        assert "test@testme.com" == outbox[0].from_email
+        matcher = re.match(
+            r".*ExtraContext:(\S+).*", outbox[0].body, re.IGNORECASE | re.DOTALL
+        )
+        assert matcher.group(1) == "bar-mail"
+
+
 @pytest.mark.babel()
+@pytest.mark.app_settings(babel_default_locale="fr_FR")
 def test_xlation(app, client):
-    app.config["BABEL_DEFAULT_LOCALE"] = "fr_FR"
     assert check_xlation(app, "fr_FR"), "You must run python setup.py compile_catalog"
 
     response = client.get("/login")
@@ -501,6 +631,7 @@ def test_xlation(app, client):
 
 
 @pytest.mark.babel()
+@pytest.mark.app_settings(babel_default_locale="fr_FR")
 def test_myxlation(app, sqlalchemy_datastore, pytestconfig):
     # Test changing a single MSG and having an additional translation dir
     # Flask-BabelEx doesn't support lists of directories..
@@ -519,7 +650,6 @@ def test_myxlation(app, sqlalchemy_datastore, pytestconfig):
         app, sqlalchemy_datastore, **{"SECURITY_I18N_DIRNAME": i18n_dirname}
     )
 
-    app.config["BABEL_DEFAULT_LOCALE"] = "fr_FR"
     assert check_xlation(app, "fr_FR"), "You must run python setup.py compile_catalog"
 
     app.config["SECURITY_MSG_INVALID_PASSWORD"] = ("Password no-worky", "error")
@@ -530,8 +660,8 @@ def test_myxlation(app, sqlalchemy_datastore, pytestconfig):
 
 
 @pytest.mark.babel()
+@pytest.mark.app_settings(babel_default_locale="fr_FR")
 def test_form_labels(app, sqlalchemy_datastore):
-    app.config["BABEL_DEFAULT_LOCALE"] = "fr_FR"
     app.security = Security()
     app.security.init_app(app, sqlalchemy_datastore)
     assert check_xlation(app, "fr_FR"), "You must run python setup.py compile_catalog"
@@ -557,6 +687,7 @@ def test_form_labels(app, sqlalchemy_datastore):
 
 
 @pytest.mark.babel()
+@pytest.mark.app_settings(babel_default_locale="fr_FR")
 def test_wtform_xlation(app, sqlalchemy_datastore):
     # Make sure wtform xlations work
     class MyLoginForm(LoginForm):
@@ -564,7 +695,6 @@ def test_wtform_xlation(app, sqlalchemy_datastore):
             "FixedLength", validators=[DataRequired(), Length(3, 3)]
         )
 
-    app.config["BABEL_DEFAULT_LOCALE"] = "fr_FR"
     app.security = Security()
     app.security.init_app(app, datastore=sqlalchemy_datastore, login_form=MyLoginForm)
     assert check_xlation(app, "fr_FR"), "You must run python setup.py compile_catalog"
@@ -594,7 +724,6 @@ def test_per_request_xlate(app, client):
 
     babel = app.extensions["babel"]
 
-    @babel.localeselector
     def get_locale():
         # For a given session - set lang based on first request.
         # Honor explicit url request first
@@ -605,6 +734,9 @@ def test_per_request_xlate(app, client):
             if locale:
                 session["lang"] = locale
         return session.get("lang", None).replace("-", "_")
+
+    babel.locale_selector_func = get_locale
+    babel.locale_selector = get_locale  # Flask-Babel >= 3.0.0
 
     response = client.get("/login", headers=[("Accept-Language", "fr")])
     assert b'<label for="password">Mot de passe</label>' in response.data
@@ -665,7 +797,6 @@ def test_zxcvbn_xlate(app):
 @pytest.mark.skipif(sys.version_info < (3, 0), reason="requires python3 or higher")
 @pytest.mark.settings(password_check_breached="strict")
 def test_breached(app, sqlalchemy_datastore):
-
     # partial response from: https://api.pwnedpasswords.com/range/07003
     pwned_response = b"AF5A73CD3CBCFDCD12B0B68CB7930F3E888:2\r\n\
 AFD8AA47E6FD782ADDC11D89744769F7354:2\r\n\
@@ -694,7 +825,6 @@ B3902FD808DCA504AAAD30F3C14BD3ACE7C:10"
     password_complexity_checker="zxcvbn",
 )
 def test_breached_cnt(app, sqlalchemy_datastore):
-
     # partial response from: https://api.pwnedpasswords.com/range/07003
     pwned_response = b"AF5A73CD3CBCFDCD12B0B68CB7930F3E888:2\r\n\
 AFD8AA47E6FD782ADDC11D89744769F7354:2\r\n\
@@ -1241,3 +1371,46 @@ def test_reuse_security_object(sqlalchemy_datastore):
 
     security.init_app(app)
     assert hasattr(app, "login_manager")
+
+
+@pytest.mark.settings(static_folder_url="/mystatic/fs")
+def test_static_url(app, sqlalchemy_datastore):
+    from flask_security import url_for_security
+    from flask import url_for
+
+    init_app_with_options(app, sqlalchemy_datastore)
+    with app.test_request_context("http://localhost:5001/login"):
+        static_url = url_for_security("static", filename="js/webauthn.js")
+        assert static_url == "/mystatic/fs/js/webauthn.js"
+
+        static_url = url_for(".static", filename="js/webauthn.js")
+        assert static_url == "/mystatic/fs/js/webauthn.js"
+
+
+def test_multi_app(app, sqlalchemy_datastore):
+    # test that 2 different app with 2 different FS
+    # with USERNAME_ENABLE which dynamically changes the class definition
+    app = Flask(__name__)
+    app.response_class = Response
+    app.debug = True
+    app.config["SECRET_KEY"] = "secret"
+    app.config["TESTING"] = True
+    app.config["SECURITY_USERNAME_ENABLE"] = True
+
+    security = Security(datastore=sqlalchemy_datastore)
+    security.init_app(app)
+    assert hasattr(security.forms["register_form"].cls, "username")
+    assert "username" in security.user_identity_attributes[1].keys()
+
+    app = Flask(__name__)
+    app.response_class = Response
+    app.debug = True
+    app.config["SECRET_KEY"] = "secret"
+    app.config["TESTING"] = True
+    app.config["SECURITY_USERNAME_ENABLE"] = True
+
+    security2 = Security(datastore=sqlalchemy_datastore)
+    security2.init_app(app)
+
+    assert hasattr(security2.forms["register_form"].cls, "username")
+    assert "username" in security2.user_identity_attributes[1].keys()

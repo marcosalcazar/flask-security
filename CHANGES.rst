@@ -3,6 +3,93 @@ Flask-Security Changelog
 
 Here you can see the full list of changes between each Flask-Security release.
 
+Version 5.1.1
+-------------
+
+Released TBD
+
+Fixes
++++++
+
+- (:issue:`740`) Fix 2 Flask apps in same thread with USERNAME_ENABLE set.
+  There was a too aggressive config check.
+- (:pr:`739`) Update Russian translations. (ademaro)
+- (:pr:`743`) Run all templates through a linter. (ademaro)
+- (:pr:`757`) Fix json/flask backwards compatibility hack.
+- (:issue:`759`) Fix quickstarts - make sure they run using `flask run`
+- (:pr:`755`) Fix unified signup when two-factor not enabled. (sebdroid)
+
+Version 5.1.0
+-------------
+
+Released January 23, 2023
+
+Features
+++++++++
+
+- (:issue:`667`) Expose form instantiation. See :ref:`form_instantiation`.
+- (:issue:`693`) Option to encrypt recovery codes.
+- (:pr:`716`) Support for authentication via 'social' oauth.
+- (:pr:`721`) Support for Python 3.11
+
+Fixes
++++++
+
+- (:pr:`678`) Fixes for Flask-SQLAlchemy 3.0.0. (jrast)
+- (:pr:`680`) Fixes for sqlalchemy 2.0.0 (jrast)
+- (:issue:`697`) Webauthn and Unified signin features now properly take into
+  account blueprint prefixes.
+- (:issue:`699`) Properly propagate `?next=/xx` - the verify, webauthn, and unified
+  signin endpoints, that had multiple redirects, needed fixes.
+- (:pr:`696`) Add Hungarian translations. (xQwexx)
+- (:issue:`701`) Two factor redirects ignored url_prefix. Added a :py:data:`SECURITY_TWO_FACTOR_ERROR_VIEW`
+  configuration option.
+- (:issue:`704`) Add configurations for static folder/URL and make sure templates reference
+  blueprint relative static folder.
+- (:issue:`709`) Make (some) templates look better by using single quotes instead of
+  double quotes.
+- (:issue:`690`) Send entire context to MailUtil::send_mail (patrickyan)
+- (:pr:`728`) Support for Flask-Babel 3.0.0
+- (:issue:`692`) Add configuration option :py:data:`SECURITY_TWO_FACTOR_POST_SETUP_VIEW` which
+  is redirected to upon successful change of a two factor method.
+- (:pr:`733`) The ability to pass in a LoginManager instance which was deprecated in
+  5.0 has been removed.
+- (:issue:`732`) If :py:data:`SECURITY_USERNAME_REQUIRED` was ``True`` then users couldn't login
+  with just an email.
+- (:issue:`734`) If :py:data:`SECURITY_USERNAME_ENABLE` is set, bleach is a requirement.
+- (:pr:`736`) The unauthz_handler now takes a function name, not the function!
+
+Backwards Compatibility Concerns
++++++++++++++++++++++++++++++++++
+
+- Each form class used to be set as an attribute on the Security object. With
+  the new form instantiation model, they no longer are.
+- After a successful update/change of a two-factor method, the user was redirected to
+  :py:data:`SECURITY_POST_LOGIN_VIEW`. Now it redirects to :py:data:`SECURITY_TWO_FACTOR_POST_SETUP_VIEW`
+  which defaults to `".two_factor_setup"`.
+- The :meth:`.Security.unauthz_handler` now takes a function name - not the function -
+  which never made sense.
+
+Version 5.0.2
+-------------
+
+Released September 23, 2022
+
+Fixes
++++++
+- (:issue:`673`) Role permissions backwards compatibility bug. For SQL based datastores
+  that use Flask-Security's models.fsqla_vx - there should be NO issues. If you declare
+  your own models - please see the 5.0.0 releases notes for required change.
+
+Version 5.0.1
+-------------
+
+Released September 6, 2022
+
+Fixes
++++++
+- (:pr:`662`) Fix Change Password regression. (tysonholub)
+
 Version 5.0.0
 -------------
 
@@ -38,10 +125,11 @@ Deprecations
 - (:pr:`657`) The ability to pass in a json_encoder_cls as part of initialization has been removed
   since Flask 2.2 has deprecated and replaced that functionality.
 - (:pr:`655`) Flask has deprecated @before_first_request. This was used mostly in examples/quickstart.
-  These have been changed to use app.app_context() prior to running the app. FS itself used it in
+  These have been changed to use app.app_context() prior to running the app. Flask-Security itself used it in
   2 places - to populate `_` in jinja globals if Babel wasn't initialized and to perform
-  various configuration sanity checks w.r.t. WTF CSRF. All FS templates have been converted
-  to use `_fsdomain` rather than ``_`` so FS no longer will populate ``_``. The configuration checks
+  various configuration sanity checks w.r.t. WTF CSRF. All Flask-Security templates have been converted
+  to use `_fsdomain` rather than ``_`` so Flask-Security no longer sets ``_`` into jinja2 globals.
+  The configuration checks
   have been moved to the end of Security::init_app() - so it is now imperative that `FlaskWTF::CSRFProtect()`
   be called PRIOR to initializing Flask-Security.
 - encrypt_password method has been removed. It has been deprecated since 2.0.2
@@ -125,11 +213,22 @@ Other:
   The key `field_errors` will contain the dict as specified by WTForms. Please note that starting with WTForms 3.0
   form-level errors are supported and show up in the dict with the field name/key of "none". There are no changes to non-error
   related JSON responses.
-- Permissions - The Role Model now stores permissions as a list, and requires that the underlying DB ORM map that to a supported
-  DB type. For SQLAlchemy, this is mapped to a comma separated string (as before). For Mongo, a ListField can be directly used. For
-  SQLAlchemy DBs the Column type (UnicodeText) didn't change so no data migration should be required.
+- Permissions **THIS IS A BREAKING CHANGE**. The Role Model now stores permissions as a list, and requires that the underlying DB ORM map that to a supported
+  DB type. For SQLAlchemy, this is mapped to a comma separated string (as before). For
+  SQLAlchemy DBs the underlying Column type (UnicodeText) didn't change so no data migration should be required.
+  However, the ORM Column type did change and requires the following change to your model::
+
+    from flask_security import AsaList
+    from sqlalchemy.ext.mutable import MutableList
+    class Role(Base, RoleMixin):
+        ...
+        permissions = Column(MutableList.as_mutable(AsaList()), nullable=True)
+        ...
+
+  If your application makes use of Flask-Security's models.fsqla_vX classes - no changes are required.
+  For Mongo, a ListField can be directly used.
 - CSRF - As mentioned above, it is now required that `FlaskWTF::CSRFProtect()`, if used, must be called PRIOR to initializing Flask-Security.
-- json_encoder_cls - As mentioned above - Flask-Security initialization on longer accepts overriding the json_encoder class. If this is required,
+- json_encoder_cls - As mentioned above - Flask-Security initialization no longer accepts overriding the json_encoder class. If this is required,
   update to Flask >=2.2 and implement Flask's JSONProvider interface.
 
 For templates:

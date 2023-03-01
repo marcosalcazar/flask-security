@@ -7,11 +7,12 @@
     :copyright: (c) 2012 by Matt Wright.
     :copyright: (c) 2017 by CERN.
     :copyright: (c) 2017 by ETH Zurich, Swiss Data Science Center.
-    :copyright: (c) 2019-2022 by J. Christopher Wagner (jwag).
+    :copyright: (c) 2019-2023 by J. Christopher Wagner (jwag).
     :license: MIT, see LICENSE for more details.
 """
 
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 import importlib
 import re
 import typing as t
@@ -38,9 +39,8 @@ from .forms import (
     ChangePasswordForm,
     ConfirmRegisterForm,
     ForgotPasswordForm,
+    Form,
     LoginForm,
-    MfRecoveryForm,
-    MfRecoveryCodesForm,
     PasswordlessLoginForm,
     RegisterForm,
     RegisterFormMixin,
@@ -50,14 +50,20 @@ from .forms import (
     TwoFactorSetupForm,
     TwoFactorRescueForm,
     VerifyForm,
+    get_register_username_field,
     login_username_field,
-    register_username_field,
 )
 from .json import setup_json
 from .mail_util import MailUtil
 from .password_util import PasswordUtil
 from .phone_util import PhoneUtil
+from .oauth_glue import OAuthGlue
 from .proxies import _security
+from .recovery_codes import (
+    MfRecoveryForm,
+    MfRecoveryCodesForm,
+    MfRecoveryCodesUtil,
+)
 from .tf_plugin import TfPlugin, TwoFactorSelectForm
 from .twofactor import tf_send_security_token
 from .unified_signin import (
@@ -104,6 +110,7 @@ if t.TYPE_CHECKING:  # pragma: no cover
     from flask import Request
     from flask.typing import ResponseValue
     import flask_login.mixins
+    from authlib.integrations.flask_client import OAuth
     from .datastore import Role, User, UserDatastore
 
 
@@ -117,6 +124,8 @@ _default_config: t.Dict[str, t.Any] = {
     "CLI_ROLES_NAME": "roles",
     "CLI_USERS_NAME": "users",
     "URL_PREFIX": None,
+    "STATIC_FOLDER": "static",
+    "STATIC_FOLDER_URL": "/fs-static",
     "SUBDOMAIN": None,
     "FLASH_MESSAGES": True,
     "RETURN_GENERIC_RESPONSES": False,
@@ -169,6 +178,8 @@ _default_config: t.Dict[str, t.Any] = {
     "TWO_FACTOR_TOKEN_VALIDATION_URL": "/tf-validate",
     "TWO_FACTOR_RESCUE_URL": "/tf-rescue",
     "TWO_FACTOR_SELECT_URL": "/tf-select",
+    "TWO_FACTOR_POST_SETUP_VIEW": ".two_factor_setup",  # endpoint or URL
+    "TWO_FACTOR_ERROR_VIEW": ".login",
     "LOGOUT_METHODS": ["GET", "POST"],
     "POST_LOGIN_VIEW": "/",
     "POST_LOGOUT_VIEW": "/",
@@ -229,6 +240,12 @@ _default_config: t.Dict[str, t.Any] = {
     "MULTI_FACTOR_RECOVERY_CODES_TEMPLATE": "security/mf_recovery_codes.html",
     "MULTI_FACTOR_RECOVERY_URL": "/mf-recovery",
     "MULTI_FACTOR_RECOVERY_TEMPLATE": "security/mf_recovery.html",
+    "MULTI_FACTOR_RECOVERY_CODES_KEYS": None,
+    "MULTI_FACTOR_RECOVERY_CODE_TTL": None,
+    "OAUTH_ENABLE": False,
+    "OAUTH_BUILTIN_PROVIDERS": ["github", "google"],
+    "OAUTH_START_URL": "/login/oauthstart",
+    "OAUTH_RESPONSE_URL": "/login/oauthresponse",
     "CONFIRM_EMAIL_WITHIN": "5 days",
     "RESET_PASSWORD_WITHIN": "5 days",
     "LOGIN_WITHOUT_CONFIRMATION": False,
@@ -297,7 +314,7 @@ _default_config: t.Dict[str, t.Any] = {
     "US_VERIFY_URL": "/us-verify",
     "US_VERIFY_SEND_CODE_URL": "/us-verify/send-code",
     "US_VERIFY_LINK_URL": "/us-verify-link",
-    "US_POST_SETUP_VIEW": "/us-setup",
+    "US_POST_SETUP_VIEW": ".us_setup",  # endpoint or URL
     "US_SIGNIN_TEMPLATE": "security/us_signin.html",
     "US_SETUP_TEMPLATE": "security/us_setup.html",
     "US_VERIFY_TEMPLATE": "security/us_verify.html",
@@ -327,7 +344,7 @@ _default_config: t.Dict[str, t.Any] = {
     "USERNAME_NORMALIZE_FORM": "NFKD",
     "WEBAUTHN": False,
     "WAN_CHALLENGE_BYTES": None,  # uses system default
-    "WAN_POST_REGISTER_VIEW": "/wan-register",
+    "WAN_POST_REGISTER_VIEW": ".wan_register",  # endpoint or URL
     "WAN_RP_NAME": "My Flask App",
     "WAN_SALT": "wan-salt",
     "WAN_REGISTER_TIMEOUT": 60000,  # milliseconds
@@ -393,10 +410,22 @@ _default_messages = {
         ),
         "error",
     ),
+    "IDENTITY_NOT_REGISTERED": (
+        _("Identity %(id)s not registered"),
+        "error",
+    ),
+    "OAUTH_HANDSHAKE_ERROR": (
+        _(
+            "An error occurred while communicating with the Oauth provider. "
+            "Please try again."
+        ),
+        "error",
+    ),
     "PASSWORD_MISMATCH": (_("Password does not match"), "error"),
     "RETYPE_PASSWORD_MISMATCH": (_("Passwords do not match"), "error"),
     "INVALID_REDIRECT": (_("Redirections outside the domain are forbidden"), "error"),
     "INVALID_RECOVERY_CODE": (_("Recovery code invalid"), "error"),
+    "NO_RECOVERY_CODES_SETUP": (_("No recovery codes generated yet"), "info"),
     "PASSWORD_RESET_REQUEST": (
         _("Instructions to reset your password have been sent to %(email)s."),
         "info",
@@ -570,6 +599,40 @@ _default_messages = {
 }
 
 
+def _default_form_instantiator(
+    name: str, cls: t.Type[Form], *args: t.Any, **kwargs: t.Dict[str, t.Any]
+) -> Form:
+    return cls(*args, **kwargs)
+
+
+@dataclass
+class FormInfo:
+    """
+    Each view form has a name - assigned by Flask-Security.
+    As part of every request, the form is instantiated using (usually) request.form or
+    request.json.
+    The default instantiator simply uses the class constructor - however
+    applications can provide their OWN instantiator which can do pretty much anything
+    as long as it returns an instantiated form. The 'cls' argument is optional since
+    the instantiator COULD be form specific.
+
+    The instantiator callable will always be called from a flask request context
+    and receive the following arguments::
+
+        (name, form_cls_name (optional), **kwargs)
+
+    kwargs will always have `formdata` and often will have `meta`. All kwargs
+    must be passed to the underlying form constructor.
+
+    See :py:meth:`flask_security.Security.set_form_info`
+
+    .. versionadded:: 5.1.0
+    """
+
+    instantiator: t.Callable[..., Form] = _default_form_instantiator
+    cls: t.Optional[t.Type[Form]] = None
+
+
 def _user_loader(user_id):
     """Load based on fs_uniquifier (alternative_id)."""
     user = _security.datastore.find_user(fs_uniquifier=str(user_id))
@@ -664,7 +727,7 @@ def _get_login_manager(app, anonymous_user):
     lm = LoginManager()
     lm.anonymous_user = anonymous_user or AnonymousUser
     lm.localize_callback = localize_callback
-    lm.login_view = "%s.login" % cv("BLUEPRINT_NAME", app=app)
+    lm.login_view = f'{cv("BLUEPRINT_NAME", app=app)}.login'
     lm.user_loader(_user_loader)
     lm.request_loader(_request_loader)
 
@@ -694,8 +757,7 @@ def _get_pwd_context(app: "flask.Flask") -> CryptContext:
     if pw_hash not in schemes:
         allowed = ", ".join(schemes[:-1]) + " and " + schemes[-1]
         raise ValueError(
-            "Invalid password hashing scheme %r. Allowed values are %s"
-            % (pw_hash, allowed)
+            f"Invalid password hashing scheme {pw_hash}. Allowed values are {allowed}"
         )
     cc = CryptContext(
         schemes=schemes,
@@ -727,7 +789,7 @@ class RoleMixin:
 
     if t.TYPE_CHECKING:  # pragma: no cover
 
-        def __init__(self):
+        def __init__(self) -> None:
             self.permissions: t.Optional[t.List[str]]
 
     def __eq__(self, other):
@@ -999,7 +1061,6 @@ class Security:
     :param wan_delete_form: set form for deleting a webauthn security key
     :param wan_verify_form: set form for using a webauthn key to verify authenticity
     :param anonymous_user: class to use for anonymous user
-    :param login_manager: An subclass of LoginManager
     :param mail_util_cls: Class to use for sending emails. Defaults to :class:`MailUtil`
     :param password_util_cls: Class to use for password normalization/validation.
      Defaults to :class:`PasswordUtil`
@@ -1010,6 +1071,11 @@ class Security:
     :param totp_cls: Class to use as TOTP factory. Defaults to :class:`Totp`
     :param username_util_cls: Class to use for normalizing and validating usernames.
         Defaults to :class:`UsernameUtil`
+    :param webauthn_util_cls: Class to use for customizing WebAuthn registration
+        and signin. Defaults to :class:`WebauthnUtil`
+    :param mf_recovery_codes_util_cls: Class for generating, checking, encrypting
+        and decrypting recovery codes. Defaults to :class:`MfRecoveryCodesUtil`
+    :param oauth: An instance of authlib.integrations.flask_client.OAuth
 
     .. tip::
         Be sure that all your configuration values have been set PRIOR to
@@ -1047,6 +1113,8 @@ class Security:
     .. versionadded:: 5.0.0
         Added support for multi-factor recovery codes ``mf_recovery_codes_form``,
         ``mf_recovery_form``.
+    .. versionadded:: 5.1.0
+        ``mf_recovery_codes_util_cls``, ``oauth``
 
     .. deprecated:: 4.0.0
         ``send_mail`` and ``send_mail_task``. Replaced with ``mail_util_cls``.
@@ -1054,7 +1122,7 @@ class Security:
         ``password_validator`` removed in favor of the new ``password_util_cls``.
 
     .. deprecated:: 5.0.0
-        Passing in a LoginManager instance.
+        Passing in a LoginManager instance. Removed in 5.1.0
     .. deprecated:: 5.0.0
         json_encoder_cls is no longer honored since Flask 2.2 has deprecated it.
     """
@@ -1098,7 +1166,6 @@ class Security:
         wan_delete_form: t.Type[WebAuthnDeleteForm] = WebAuthnDeleteForm,
         wan_verify_form: t.Type[WebAuthnVerifyForm] = WebAuthnVerifyForm,
         anonymous_user: t.Optional[t.Type["flask_login.AnonymousUserMixin"]] = None,
-        login_manager: t.Optional["flask_login.LoginManager"] = None,
         mail_util_cls: t.Type["MailUtil"] = MailUtil,
         password_util_cls: t.Type["PasswordUtil"] = PasswordUtil,
         phone_util_cls: t.Type["PhoneUtil"] = PhoneUtil,
@@ -1106,9 +1173,10 @@ class Security:
         totp_cls: t.Type["Totp"] = Totp,
         username_util_cls: t.Type["UsernameUtil"] = UsernameUtil,
         webauthn_util_cls: t.Type["WebauthnUtil"] = WebauthnUtil,
+        mf_recovery_codes_util_cls: t.Type["MfRecoveryCodesUtil"] = MfRecoveryCodesUtil,
+        oauth: t.Optional["OAuth"] = None,
         **kwargs: t.Any,
     ):
-
         # to be nice and hopefully avoid backwards compat issues - we still accept
         # kwargs - but we don't do anything with them. If caller sends in some -
         # output a deprecation warning
@@ -1116,37 +1184,12 @@ class Security:
             warnings.warn(
                 "kwargs passed to the constructor are now ignored",
                 DeprecationWarning,
+                stacklevel=4,
             )
         self.app = app
         self._datastore = datastore
         self._register_blueprint = register_blueprint
-        self.login_form = login_form
-        self.verify_form = verify_form
-        self.confirm_register_form = confirm_register_form
-        self.register_form = register_form
-        self.forgot_password_form = forgot_password_form
-        self.reset_password_form = reset_password_form
-        self.change_password_form = change_password_form
-        self.send_confirmation_form = send_confirmation_form
-        self.passwordless_login_form = passwordless_login_form
-        self.two_factor_verify_code_form = two_factor_verify_code_form
-        self.two_factor_setup_form = two_factor_setup_form
-        self.two_factor_rescue_form = two_factor_rescue_form
-        self.two_factor_select_form = two_factor_select_form
-        self.mf_recovery_codes_form = mf_recovery_codes_form
-        self.mf_recovery_form = mf_recovery_form
-        self.us_signin_form = us_signin_form
-        self.us_setup_form = us_setup_form
-        self.us_setup_validate_form = us_setup_validate_form
-        self.us_verify_form = us_verify_form
-        self.wan_register_form = wan_register_form
-        self.wan_register_response_form = wan_register_response_form
-        self.wan_signin_form = wan_signin_form
-        self.wan_signin_response_form = wan_signin_response_form
-        self.wan_delete_form = wan_delete_form
-        self.wan_verify_form = wan_verify_form
         self.anonymous_user = anonymous_user
-        self.login_manager = login_manager
         self.mail_util_cls = mail_util_cls
         self.password_util_cls = password_util_cls
         self.phone_util_cls = phone_util_cls
@@ -1154,6 +1197,38 @@ class Security:
         self.totp_cls = totp_cls
         self.username_util_cls = username_util_cls
         self.webauthn_util_cls = webauthn_util_cls
+        self.mf_recovery_codes_util_cls = mf_recovery_codes_util_cls
+        self._oauth = oauth
+
+        # Forms - we create a list from constructor.
+        # BC - in init_app we will allow override of class.
+        self.forms = {
+            "login_form": FormInfo(cls=login_form),
+            "verify_form": FormInfo(cls=verify_form),
+            "confirm_register_form": FormInfo(cls=confirm_register_form),
+            "register_form": FormInfo(cls=register_form),
+            "forgot_password_form": FormInfo(cls=forgot_password_form),
+            "reset_password_form": FormInfo(cls=reset_password_form),
+            "change_password_form": FormInfo(cls=change_password_form),
+            "send_confirmation_form": FormInfo(cls=send_confirmation_form),
+            "passwordless_login_form": FormInfo(cls=passwordless_login_form),
+            "two_factor_verify_code_form": FormInfo(cls=two_factor_verify_code_form),
+            "two_factor_setup_form": FormInfo(cls=two_factor_setup_form),
+            "two_factor_rescue_form": FormInfo(cls=two_factor_rescue_form),
+            "two_factor_select_form": FormInfo(cls=two_factor_select_form),
+            "mf_recovery_codes_form": FormInfo(cls=mf_recovery_codes_form),
+            "mf_recovery_form": FormInfo(cls=mf_recovery_form),
+            "us_signin_form": FormInfo(cls=us_signin_form),
+            "us_setup_form": FormInfo(cls=us_setup_form),
+            "us_setup_validate_form": FormInfo(cls=us_setup_validate_form),
+            "us_verify_form": FormInfo(cls=us_verify_form),
+            "wan_register_form": FormInfo(cls=wan_register_form),
+            "wan_register_response_form": FormInfo(cls=wan_register_response_form),
+            "wan_signin_form": FormInfo(cls=wan_signin_form),
+            "wan_signin_response_form": FormInfo(cls=wan_signin_response_form),
+            "wan_delete_form": FormInfo(cls=wan_delete_form),
+            "wan_verify_form": FormInfo(cls=wan_verify_form),
+        }
 
         # Attributes not settable from init.
         self._unauthn_handler: t.Callable[
@@ -1163,7 +1238,7 @@ class Security:
             [timedelta, timedelta], "ResponseValue"
         ] = default_reauthn_handler
         self._unauthz_handler: t.Callable[
-            [t.Callable[[t.Any], t.Any], t.Optional[t.List[str]]], "ResponseValue"
+            [str, t.Optional[t.List[str]]], "ResponseValue"
         ] = default_unauthz_handler
         self._unauthorized_callback: t.Optional[t.Callable[[], "ResponseValue"]] = None
         self._render_json: t.Callable[
@@ -1190,19 +1265,22 @@ class Security:
         self.datastore: "UserDatastore"
         self.register_blueprint: bool
         self.two_factor_plugins: TfPlugin
+        self.oauthglue: t.Optional[OAuthGlue] = None
 
+        self.login_manager: "flask_login.LoginManager"
         self._mail_util: MailUtil
         self._phone_util: PhoneUtil
         self._password_util: PasswordUtil
         self._redirect_validate_re: re.Pattern
         self._totp_factory: "Totp"
         self._username_util: UsernameUtil
+        self._mf_recovery_codes_util: MfRecoveryCodesUtil
 
         # We add forms, config etc as attributes - which of course mypy knows
         # nothing about. Add necessary attributes here to keep mypy happy
         self.trackable: bool = False
         self.confirmable: bool = False
-        self.registrable: bool = False
+        self.registerable: bool = False
         self.changeable: bool = False
         self.recoverable: bool = False
         self.two_factor: bool = False
@@ -1211,15 +1289,14 @@ class Security:
         self.webauthn: bool = False
 
         # Redirect URLs
-        self.login_url: str = ""
         self.login_error_view: str = ""
-        self.us_verify_send_code_url: str = ""
         self.post_change_view: str = ""
         self.post_login_view: str = ""
         self.post_reset_view: str = ""
         self.reset_view: str = ""
         self.reset_error_view: str = ""
         self.requires_confirmation_error_view: str = ""
+        self.two_factor_error_view: str = ""
         self.post_confirm_view: str = ""
         self.confirm_error_view: str = ""
 
@@ -1276,7 +1353,7 @@ class Security:
 
         # Override default forms
         # BC - kwarg value here overrides init/constructor time
-        # BC - we allow forms to be set as config items
+        # BC - we allow forms to be set from config
         # Can't wait for assignment expressions.
         form_names = [
             "login_form",
@@ -1306,17 +1383,15 @@ class Security:
             "wan_verify_form",
         ]
         for form_name in form_names:
-            if kwargs.get(form_name, None):
-                setattr(self, form_name, kwargs.get(form_name))
-            elif app.config.get(f"SECURITY_{form_name.upper()}", None):
-                setattr(
-                    self, form_name, app.config.get(f"SECURITY_{form_name.upper()}")
-                )
+            form_cls = kwargs.get(
+                form_name, app.config.get(f"SECURITY_{form_name.upper()}", None)
+            )
+            if form_cls:
+                self.forms[form_name].cls = form_cls
 
         # BC - Allow kwargs to overwrite/init other constructor attributes
         attr_names = [
             "anonymous_user",
-            "login_manager",
             "mail_util_cls",
             "password_util_cls",
             "phone_util_cls",
@@ -1329,7 +1404,10 @@ class Security:
 
         # set all (SECURITY) config items as attributes (minus the SECURITY_ prefix)
         for key, value in get_config(app).items():
-            setattr(self, key.lower(), value)
+            # need to start getting rid of this - especially things like *_URL which
+            # should never be referenced
+            if not key.endswith("_URL"):
+                setattr(self, key.lower(), value)
 
         identity_loaded.connect_via(app)(_on_identity_loaded)
 
@@ -1351,34 +1429,16 @@ class Security:
                     " must have one and only one key."
                 )
 
+        self.login_manager = _get_login_manager(app, self.anonymous_user)
         self._phone_util = self.phone_util_cls(app)
         self._mail_util = self.mail_util_cls(app)
         self._password_util = self.password_util_cls(app)
         self._username_util = self.username_util_cls(app)
         self._webauthn_util = self.webauthn_util_cls(app)
+        self._mf_recovery_codes_util = self.mf_recovery_codes_util_cls(app)
         rvre = cv("REDIRECT_VALIDATE_RE", app=app)
         if rvre:
             self._redirect_validate_re = re.compile(rvre)
-
-        if self.login_manager:
-            warnings.warn(
-                "Replacing login_manager is deprecated in 5.0.0 and will be"
-                " removed in 5.1",
-                DeprecationWarning,
-            )
-
-        # login_manager is a bit strange - when we initialize it we are actually
-        # initializing Flask-Login which will register itself as an extension on the
-        # Flask object and set app.login_manager.
-        # We allow apps to provide their own and pass it in as part of the constructor.
-        # While not best practice there are users who reuse
-        # the Security object on different apps (e.g. for testing).
-        # We also support the case where we replace the Security object on an existing
-        # app (we do this in test_misc).
-        # We need to re-initialize Flask-Login if the app doesn't have it yet.
-        if not hasattr(app, "login_manager") or not self.login_manager:
-            # This is the 99% case - just let us manage Flask-Login
-            self.login_manager = _get_login_manager(app, self.anonymous_user)
 
         self.remember_token_serializer = _get_serializer(app, "remember")
         self.login_serializer = _get_serializer(app, "login")
@@ -1401,28 +1461,15 @@ class Security:
                 " and will be removed in the future. Please use the Unified Signin"
                 " feature instead.",
                 DeprecationWarning,
+                stacklevel=2,
             )
         if cv("USERNAME_ENABLE", app):
             if hasattr(self.datastore, "user_model") and not hasattr(
                 self.datastore.user_model, "username"
             ):  # pragma: no cover
                 raise ValueError(
-                    "User model must contain username if"
+                    "User model must contain 'username' if"
                     " SECURITY_USERNAME_ENABLE is True"
-                )
-            # if they want USERNAME_ENABLE - then they better not have defined
-            # username in their own forms
-            if any(
-                hasattr(f, "username")
-                for f in [
-                    self.register_form,
-                    self.confirm_register_form,
-                    self.login_form,
-                ]
-            ):  # pragma: no cover
-                raise ValueError(
-                    "Your login_form or register_form has a"
-                    " 'username' attribute already"
                 )
             # if not already listed in user identity attributes, add it at the end
             uialist = []
@@ -1442,12 +1489,15 @@ class Security:
                 self.user_identity_attributes = uias
 
             # Add dynamic fields - probably overkill to check if these are our forms.
-            if issubclass(self.register_form, RegisterFormMixin):
-                self.register_form.username = register_username_field
-            if issubclass(self.confirm_register_form, RegisterFormMixin):
-                self.confirm_register_form.username = register_username_field
-            if issubclass(self.login_form, LoginForm):
-                self.login_form.username = login_username_field
+            fcls = self.forms["register_form"].cls
+            if fcls and issubclass(fcls, RegisterFormMixin):
+                fcls.username = get_register_username_field(app)
+            fcls = self.forms["confirm_register_form"].cls
+            if fcls and issubclass(fcls, RegisterFormMixin):
+                fcls.username = get_register_username_field(app)
+            fcls = self.forms["login_form"].cls
+            if fcls and issubclass(fcls, LoginForm):
+                fcls.username = login_username_field
 
         # initialize two-factor plugins. Note that each implementation likely
         # has its own feature flag which will control whether it is active or not.
@@ -1459,11 +1509,16 @@ class Security:
                 app, name, getattr(module, class_name)
             )
 
+        if cv("OAUTH_ENABLE", app=app):
+            self.oauthglue = OAuthGlue(app, self._oauth)
+
         # register our blueprint/endpoints
         bp = None
         if self.register_blueprint:
             bp = create_blueprint(app, self, __name__)
             self.two_factor_plugins.create_blueprint(app, bp, self)
+            if self.oauthglue:
+                self.oauthglue._create_blueprint(app, bp)
             app.register_blueprint(bp)
             app.context_processor(_context_processor)
 
@@ -1501,7 +1556,8 @@ class Security:
                 warnings.warn(
                     "'sms' was enabled in SECURITY_US_ENABLED_METHODS;"
                     " however 'us_phone_number' not configured in"
-                    " SECURITY_USER_IDENTITY_ATTRIBUTES"
+                    " SECURITY_USER_IDENTITY_ATTRIBUTES",
+                    stacklevel=2,
                 )
         if cv("TWO_FACTOR", app=app):
             alt_auth = True
@@ -1550,6 +1606,9 @@ class Security:
 
         if cv("WEBAUTHN", app=app):
             self._check_modules("webauthn", "WEBAUTHN")
+
+        if cv("USERNAME_ENABLE", app=app):
+            self._check_modules("bleach", "USERNAME_ENABLE")
 
         # Register so other packages can reference our translations.
         app.jinja_env.globals["_fsdomain"] = self.i18n_domain.gettext
@@ -1635,6 +1694,44 @@ class Security:
             # Add configured header to WTF_CSRF_HEADERS
             app.config["WTF_CSRF_HEADERS"].append(cv("CSRF_HEADER", app=app))
 
+    def set_form_info(self, name: str, form_info: FormInfo) -> None:
+        """Set form instantiation info.
+
+        :param name: Name of form.
+        :param form_info: see :py:class:`FormInfo`
+
+        .. admonition:: Advanced
+
+           Forms (which are all FlaskForms) are instantiated at the start of each
+           request. Normally this is done as part of a view by simply calling the
+           form class constructor - Flask-WTForms handles filling it in from
+           various request attributes.
+
+           The form classes themselves can be extended (e.g. to add or change fields)
+           and the derived class can be set at `Security` constructor time,
+           `init_app` time, or using this method.
+
+           This default implementation is suitable for most applications.
+
+           Some application might want to control the instantiation of forms, for
+           example to be able to inject additional validation services.
+           Using this method, a callable `instantiator` can be set that Flask-Security
+           will call to return a properly instantiated form.
+
+           .. danger::
+            Do not perform any validation as part of instantiation - many views have
+            a bunch of logic PRIOR to calling the form validator.
+
+            .. versionadded:: 5.1.0
+        """
+        if name not in self.forms.keys():
+            raise ValueError(f"Unknown form name {name}")
+        if form_info.instantiator == _default_form_instantiator and not form_info.cls:
+            raise ValueError(
+                "If default form instantiator is used, a form class must be provided"
+            )
+        self.forms[name] = form_info
+
     def render_json(
         self,
         cb: t.Callable[
@@ -1690,9 +1787,7 @@ class Security:
 
     def unauthz_handler(
         self,
-        cb: t.Callable[
-            [t.Callable[[t.Any], t.Any], t.Optional[t.List[str]]], "ResponseValue"
-        ],
+        cb: t.Callable[[str, t.Optional[t.List[str]]], "ResponseValue"],
     ) -> None:
         """
         Callback for failed authorization.
@@ -1702,7 +1797,7 @@ class Security:
 
         :param cb: Callback function with signature (func, params)
 
-            :func: the decorator function (e.g. roles_required)
+            :func_name: the decorator function name (e.g. 'roles_required')
             :params: list of what (if any) was passed to the decorator.
 
         Should return a Response or something Flask can create a Response from.
@@ -1713,6 +1808,9 @@ class Security:
         message.
 
         .. versionadded:: 3.3.0
+
+        .. versionchanged:: 5.1.0
+            Pass in the function name, not the function!
         """
         self._unauthz_handler = cb
 
@@ -1774,6 +1872,7 @@ class Security:
             "'unauthorized_handler' has been replaced with"
             " 'unauthz_handler' and 'unauthn_handler'",
             DeprecationWarning,
+            stacklevel=2,
         )
         self._unauthorized_callback = cb
 

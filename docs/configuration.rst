@@ -25,6 +25,23 @@ These configuration keys are used globally across all features.
 
     Default: ``None``.
 
+.. py:data:: SECURITY_STATIC_FOLDER
+
+    Specifies the folder name for static files (webauthn).
+
+    Default: ``"static"``.
+
+    .. versionadded:: 5.1.0
+
+.. py:data:: SECURITY_STATIC_FOLDER_URL
+
+    Specifies the URL for static files used by Flask-Security (webauthn).
+    See Flask documentation https://flask.palletsprojects.com/en/latest/blueprints/#static-files
+
+    Default: ``"/fs-static"``.
+
+    .. versionadded:: 5.1.0
+
 .. py:data:: SECURITY_SUBDOMAIN
 
     Specifies the subdomain for the Flask-Security blueprint. If your authenticated
@@ -218,8 +235,8 @@ These configuration keys are used globally across all features.
 
 .. py:data:: SECURITY_REDIRECT_BEHAVIOR
 
-    Passwordless login, confirmation, and reset password have GET endpoints that validate
-    the passed token and redirect to an action form.
+    Passwordless login, confirmation, reset password, unified signin, and oauth signin
+    have GET endpoints that validate the passed token and redirect to an action form.
     For Single-Page-Applications style UIs which need to control their own internal URL routing these redirects
     need to not contain forms, but contain relevant information as query parameters.
     Setting this to ``spa`` will enable that behavior.
@@ -679,6 +696,7 @@ Login/Logout
 
     Specifies the default view to redirect to after a user logs in. This value can be set to a URL
     or an endpoint name. Defaults to the Flask config ``APPLICATION_ROOT`` value which itself defaults to ``"/"``.
+    Note that if the request URL or form has a ``next`` parameter, that will take precedence.
 
     Default: ``APPLICATION_ROOT``.
 
@@ -686,6 +704,7 @@ Login/Logout
 
     Specifies the default view to redirect to after a user logs out. This value can be set to a URL
     or an endpoint name. Defaults to the Flask config ``APPLICATION_ROOT`` value which itself defaults to ``"/"``.
+    Note that if the request URL or form has a ``next`` parameter, that will take precedence.
 
     Default: ``APPLICATION_ROOT``.
 
@@ -761,6 +780,7 @@ Registerable
     Specifies the view to redirect to after a user successfully registers.
     This value can be set to a URL or an endpoint name. If this value is
     ``None``, the user is redirected to the value of ``SECURITY_POST_LOGIN_VIEW``.
+    Note that if the request URL or form has a ``next`` parameter, that will take precedence.
 
     Default: ``None``.
 .. py:data:: SECURITY_REGISTER_URL
@@ -783,7 +803,7 @@ Registerable
     Validation and normalization is encapsulated in :class:`.UsernameUtil`.
     Note that the default validation restricts username input to be unicode
     letters and numbers. It also uses ``bleach`` to scrub any risky input. Be
-    sure your application requirements includes ``bleach``.
+    sure your application requirements includes `bleach`_.
 
     Default: ``False``
 
@@ -1126,6 +1146,25 @@ Configuration related to the two-factor authentication feature.
 
     .. versionadded:: 5.0.0
 
+.. py:data:: SECURITY_TWO_FACTOR_ERROR_VIEW
+
+    Specifies a URL or endpoint to redirect to if the system detects that
+    a two-factor endpoint is being accessed without the proper state. For example
+    if ``tf-validate`` is accessed but the caller hasn't yet successfully passed the
+    primary authentication.
+
+    Default: ``".login"``
+
+    .. versionadded:: 5.1.0
+
+.. py:data:: SECURITY_TWO_FACTOR_POST_SETUP_VIEW
+
+    Specifies the view to redirect to after a user successfully setups a two-factor method (non-json).
+    This value can be set to a URL or an endpoint name.
+
+    Default: ``".two_factor_setup"``
+
+    .. versionadded:: 5.1.0
 
 .. py:data:: SECURITY_TWO_FACTOR_SELECT_TEMPLATE
 
@@ -1201,7 +1240,8 @@ Unified Signin
 .. py:data:: SECURITY_US_SIGNIN_SEND_CODE_URL
 
     Endpoint that given an identity, and a previously setup authentication method, will
-    generate and return a one time code. This isn't necessary when using an authenticator app.
+    generate and return a one time code. This isn't necessary when using an authenticator
+    app.
 
     Default: ``"/us-signin/send-code"``
 
@@ -1240,7 +1280,7 @@ Unified Signin
     Specifies the view to redirect to after a user successfully setups an authentication method (non-json).
     This value can be set to a URL or an endpoint name.
 
-    Default: ``"/us-setup"``
+    Default: ``".us-setup"``
 
 .. py:data:: SECURITY_US_SIGNIN_TEMPLATE
 
@@ -1355,9 +1395,14 @@ This feature is DEPRECATED as of 5.0.0. Please use unified signin feature instea
 
 .. py:data:: SECURITY_LOGIN_ERROR_VIEW
 
-    Specifies the view/URL to redirect to after a GET passwordless link or GET
-    unified sign in magic link when there is an error.
-    This is only valid if ``SECURITY_REDIRECT_BEHAVIOR`` == ``spa``.
+    Specifies the view/URL to redirect to after the following login/authentication errors:
+
+    * GET passwordless link where the link is expired/incorrect
+    * GET unified sign in magic link when there is an error.
+    * GET on oauthresponse where there was an OAuth protocol error.
+    * GET on oauthresponse where the returned identity isn't registered.
+
+    This is only valid if :py:data:`SECURITY_REDIRECT_BEHAVIOR` == ``spa``.
     Query params in the redirect will contain the error.
 
     Default: ``None``.
@@ -1413,7 +1458,7 @@ WebAuthn
     Specifies the view to redirect to after a user successfully registers a new WebAuthn key (non-json).
     This value can be set to a URL or an endpoint name.
 
-    Default: ``"/wan-register"``
+    Default: ``".wan-register"``
 
 .. py:data:: SECURITY_WAN_REGISTER_TEMPLATE
 
@@ -1529,7 +1574,7 @@ Recovery Codes
 
     How many recovery codes to generate.
 
-    Default:: 5
+    Default:: ``5``
 
 .. py:data:: SECURITY_MULTI_FACTOR_RECOVERY_CODES_URL
 
@@ -1551,12 +1596,62 @@ Recovery Codes
 
     Default: ``"security/mf_recovery.html"``
 
+.. py:data:: SECURITY_MULTI_FACTOR_RECOVERY_CODES_KEYS
+
+    A list of keys used to encrypt the recovery codes at rest (i.e. in the database).
+    The default implementation uses cryptography.fernet (https://cryptography.io/en/latest/fernet/#cryptography.fernet.Fernet)
+    - so the keys should be generated by::
+
+        from cryptography.fernet import Fernet
+        key = Fernet.generate_key()
+
+    Multiple keys can be configured allowing for key rotation.
+
+    Default: ``None`` - recovery codes will NOT be encrypted on disk
+
+    .. versionadded:: 5.1.0
+
+.. py:data:: SECURITY_MULTI_FACTOR_RECOVERY_CODE_TTL
+
+    An integer passed to decrypt specifying the maximum age of the code.
+
+    Default: ``None`` - no TTL will be enforced.
+
+    .. versionadded:: 5.1.0
+
 Additional relevant configuration variables:
 
     * :py:data:`SECURITY_FRESHNESS` - Used to protect /mf-recovery-codes.
     * :py:data:`SECURITY_FRESHNESS_GRACE_PERIOD` - Used to protect /mf-recovery-codes.
     * :py:data:`SECURITY_TOTP_SECRETS` - TOTP/passlib is used to generate the codes.
     * :py:data:`SECURITY_TOTP_ISSUER`
+
+Social Oauth
+-------------
+    .. versionadded:: 5.1.0
+
+.. py:data:: SECURITY_OAUTH_ENABLE
+
+    To enable using external Oauth providers - set this to ``True``.
+
+.. py:data:: SECURITY_OAUTH_BUILTIN_PROVIDERS
+
+    A list of built-in providers to register.
+
+    Default: ``["google", "github"]``
+
+.. py:data:: SECURITY_OAUTH_START_URL
+
+    Endpoint for starting an Oauth authentication operation.
+
+    Default: ``"/login/oauthstart"``
+
+.. py:data:: SECURITY_OAUTH_RESPONSE_URL
+
+    Endpoint used as Oauth redirect.
+
+    Default: ``"/login/oauthresponse"``
+
 
 Feature Flags
 -------------
@@ -1572,6 +1667,7 @@ All feature flags. By default all are 'False'/not enabled.
 * :py:data:`SECURITY_UNIFIED_SIGNIN`
 * :py:data:`SECURITY_WEBAUTHN`
 * :py:data:`SECURITY_MULTI_FACTOR_RECOVERY_CODES`
+* :py:data:`SECURITY_OAUTH_ENABLE`
 
 URLs and Views
 --------------
@@ -1584,12 +1680,16 @@ A list of all URLs and Views:
 * ``SECURITY_RESET_URL``
 * ``SECURITY_CHANGE_URL``
 * ``SECURITY_CONFIRM_URL``
-* :py:data:``SECURITY_MULTI_FACTOR_RECOVERY_CODES_URL``
-* :py:data:``SECURITY_MULTI_FACTOR_RECOVERY_URL``
+* :py:data:`SECURITY_MULTI_FACTOR_RECOVERY_CODES_URL`
+* :py:data:`SECURITY_MULTI_FACTOR_RECOVERY_URL`
+* :py:data:`SECURITY_OAUTH_START_URL`
+* :py:data:`SECURITY_OAUTH_RESPONSE_URL`
 * :py:data:`SECURITY_TWO_FACTOR_SELECT_URL`
 * :py:data:`SECURITY_TWO_FACTOR_SETUP_URL`
 * :py:data:`SECURITY_TWO_FACTOR_TOKEN_VALIDATION_URL`
 * :py:data:`SECURITY_TWO_FACTOR_RESCUE_URL`
+* :py:data:`SECURITY_TWO_FACTOR_ERROR_VIEW`
+* :py:data:`SECURITY_TWO_FACTOR_POST_SETUP_VIEW`
 * ``SECURITY_POST_LOGIN_VIEW``
 * ``SECURITY_POST_LOGOUT_VIEW``
 * ``SECURITY_CONFIRM_ERROR_VIEW``
@@ -1664,6 +1764,7 @@ The default messages and error levels can be found in ``core.py``.
 * ``SECURITY_MSG_GENERIC_RECOVERY``
 * ``SECURITY_MSG_GENERIC_US_SIGNIN``
 * ``SECURITY_MSG_IDENTITY_ALREADY_ASSOCIATED``
+* ``SECURITY_MSG_IDENTITY_NOT_REGISTERED``
 * ``SECURITY_MSG_INVALID_CODE``
 * ``SECURITY_MSG_INVALID_CONFIRMATION_TOKEN``
 * ``SECURITY_MSG_INVALID_EMAIL_ADDRESS``
@@ -1676,6 +1777,8 @@ The default messages and error levels can be found in ``core.py``.
 * ``SECURITY_MSG_LOGIN``
 * ``SECURITY_MSG_LOGIN_EMAIL_SENT``
 * ``SECURITY_MSG_LOGIN_EXPIRED``
+* ``SECURITY_NO_RECOVERY_CODES_SETUP``
+* ``SECURITY_MSG_OAUTH_HANDSHAKE_ERROR``
 * ``SECURITY_MSG_PASSWORDLESS_LOGIN_SUCCESSFUL``
 * ``SECURITY_MSG_PASSWORD_BREACHED``
 * ``SECURITY_MSG_PASSWORD_BREACHED_SITE_ERROR``

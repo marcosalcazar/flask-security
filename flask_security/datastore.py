@@ -35,6 +35,32 @@ class Datastore:
         raise NotImplementedError
 
 
+try:
+    import sqlalchemy.types as types
+
+    class AsaList(types.TypeDecorator):
+        # SQL-like DBs don't have a List type - so do that here by converting to a comma
+        # separate string.
+        impl = types.UnicodeText
+
+        def process_bind_param(self, value, dialect):
+            # produce a string from an iterable
+            try:
+                return ",".join(value)
+            except TypeError:
+                return value
+
+        def process_result_value(self, value, dialect):
+            if value:
+                return value.split(",")
+            return []
+
+except ImportError:  # pragma: no cover
+
+    class AsaList:  # type: ignore
+        pass
+
+
 class SQLAlchemyDatastore(Datastore):
     def commit(self):
         self.db.session.commit()
@@ -525,11 +551,6 @@ class UserDatastore:
         """Set MF recovery codes into user record.
         Any existing codes will be erased.
 
-        .. danger::
-           Be aware that whatever `passwords` are passed in will
-           be stored directly in the DB. Do NOT pass in a plaintext passwords!
-           Best practice is to pass in ``hash_password(plaintext_password)``.
-
         .. versionadded: 5.0.0
         """
         user.mf_recovery_codes = rcs
@@ -539,7 +560,7 @@ class UserDatastore:
         codes = getattr(user, "mf_recovery_codes", [])
         return codes if codes else []
 
-    def mf_delete_recovery_code(self, user: "User", code_to_delete: str) -> bool:
+    def mf_delete_recovery_code(self, user: "User", idx: int) -> bool:
         """Delete a single recovery code.
         Recovery codes are single-use - so delete after using!
 
@@ -550,10 +571,10 @@ class UserDatastore:
         if not user.mf_recovery_codes:
             return False
         try:
-            user.mf_recovery_codes.remove(code_to_delete)
+            user.mf_recovery_codes.pop(idx)
             self.put(user)
             return True
-        except ValueError:
+        except IndexError:
             return False
 
     def us_get_totp_secrets(self, user: "User") -> t.Dict[str, str]:
@@ -744,7 +765,7 @@ class SQLAlchemyUserDatastore(SQLAlchemyDatastore, UserDatastore):
         if cv("JOIN_USER_ROLES") and hasattr(self.user_model, "roles"):
             from sqlalchemy.orm import joinedload
 
-            query = query.options(joinedload(self.user_model.roles))
+            query = query.options(joinedload(self.user_model.roles))  # type: ignore
 
         if case_insensitive:
             # While it is of course possible to pass in multiple keys to filter on
@@ -829,7 +850,7 @@ class SQLAlchemySessionUserDatastore(SQLAlchemyUserDatastore, SQLAlchemyDatastor
 
         SQLAlchemyUserDatastore.__init__(
             self,
-            PretendFlaskSQLAlchemyDb(session),
+            PretendFlaskSQLAlchemyDb(session),  # type: ignore
             user_model,
             role_model,
             webauthn_model,

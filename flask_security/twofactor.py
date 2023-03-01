@@ -5,15 +5,14 @@
     Flask-Security two_factor module
 
     :copyright: (c) 2016 by Gal Stainfeld, at Emedgene
-    :copyright: (c) 2019-2022 by J. Christopher Wagner (jwag).
+    :copyright: (c) 2019-2023 by J. Christopher Wagner (jwag).
 """
 
 import typing as t
 
 from flask import current_app as app, redirect, request, session
-from werkzeug.datastructures import MultiDict
 
-from .forms import TwoFactorRescueForm
+from .forms import DummyForm, TwoFactorRescueForm
 from .proxies import _security, _datastore
 from .tf_plugin import TfPluginBase, tf_clean_session
 from .utils import (
@@ -65,7 +64,7 @@ def tf_send_security_token(user, method, totp_secret, phone_number):
             username=user.calc_username(),
         )
     elif method == "sms":
-        msg = "Use this code to log in: %s" % token_to_be_sent
+        msg = f"Use this code to log in: {token_to_be_sent}"
         from_number = cv("SMS_SERVICE_CONFIG")["PHONE_NUMBER"]
         to_number = phone_number
         sms_sender = SmsSenderFactory.createSender(cv("SMS_SERVICE"))
@@ -80,6 +79,7 @@ def tf_send_security_token(user, method, totp_secret, phone_number):
         user=user,
         method=method,
         token=token_to_be_sent,
+        login_token=token_to_be_sent,
         phone_number=phone_number,
     )
 
@@ -158,7 +158,7 @@ class CodeTfPlugin(TfPluginBase):
         return []
 
     def tf_login(
-        self, user: "User", json_payload: t.Dict[str, t.Any]
+        self, user: "User", json_payload: t.Dict[str, t.Any], next_loc: t.Optional[str]
     ) -> "ResponseValue":
         """Helper for two-factor authentication login
 
@@ -203,9 +203,12 @@ class CodeTfPlugin(TfPluginBase):
                         return _security._render_json(payload, 500, None, None)
 
             if not _security._want_json(request):
-                return redirect(url_for_security("two_factor_token_validation"))
+                values = dict(next=next_loc) if next_loc else dict()
+                return redirect(
+                    url_for_security("two_factor_token_validation", **values)
+                )
 
         # JSON response - Fake up a form - doesn't really matter which.
-        form = _security.login_form(MultiDict([]))
+        form = DummyForm(formdata=None)
         form.user = user
         return base_render_json(form, include_user=False, additional=json_payload)

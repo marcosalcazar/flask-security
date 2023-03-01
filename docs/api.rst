@@ -175,6 +175,9 @@ Utils
 .. autoclass:: flask_security.SmsSenderFactory
   :members: createSender
 
+.. autoclass:: flask_security.OAuthGlue
+  :members:
+
 
 Extendable Classes
 ------------------
@@ -190,6 +193,10 @@ Security() instantiation.
   :special-members: __init__
 
 .. autoclass:: flask_security.PasswordUtil
+  :members:
+  :special-members: __init__
+
+.. autoclass:: flask_security.MfRecoveryCodesUtil
   :members:
   :special-members: __init__
 
@@ -233,6 +240,8 @@ Forms
 .. autoclass:: flask_security.WebAuthnSigninResponseForm
 .. autoclass:: flask_security.WebAuthnDeleteForm
 .. autoclass:: flask_security.WebAuthnVerifyForm
+.. autoclass:: flask_security.Form
+.. autoclass:: flask_security.FormInfo
 
 .. _signals_topic:
 
@@ -335,7 +344,7 @@ sends the following signals.
 .. data:: tf_security_token_sent
 
     Sent when a two factor security/access code is sent. In addition to the app
-    (which is the sender), it is passed `user`, `method`, and `token` arguments.
+    (which is the sender), it is passed `user`, `method`, `login_token` and `token` (deprecated) arguments.
 
     .. versionadded:: 3.3.0
 

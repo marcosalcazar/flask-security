@@ -5,7 +5,7 @@
     Flask-Security decorators module
 
     :copyright: (c) 2012-2019 by Matt Wright.
-    :copyright: (c) 2019-2022 by J. Christopher Wagner (jwag).
+    :copyright: (c) 2019-2023 by J. Christopher Wagner (jwag).
     :license: MIT, see LICENSE for more details.
 """
 
@@ -115,7 +115,7 @@ def default_reauthn_handler(within, grace):
     return redirect(redirect_url)
 
 
-def default_unauthz_handler(func, params):
+def default_unauthz_handler(func_name, params):
     unauthz_message, unauthz_message_type = get_message("UNAUTHORIZED")
     if _security._want_json(request):
         payload = json_error_response(errors=unauthz_message)
@@ -237,7 +237,7 @@ def http_auth_required(realm: t.Any) -> DecoratedView:
                 return _security._unauthorized_callback()
             else:
                 r = _security.default_http_auth_realm if callable(realm) else realm
-                h = {"WWW-Authenticate": 'Basic realm="%s"' % r}
+                h = {"WWW-Authenticate": f'Basic realm="{r}"'}
                 return _security._unauthn_handler(["basic"], h)
 
         return wrapper
@@ -274,7 +274,7 @@ def auth_token_required(fn: DecoratedView) -> DecoratedView:
 def auth_required(
     *auth_methods: t.Union[str, t.Callable[[], t.List[str]], None],
     within: t.Union[int, float, t.Callable[[], datetime.timedelta]] = -1,
-    grace: t.Optional[t.Union[int, float, t.Callable[[], datetime.timedelta]]] = None
+    grace: t.Optional[t.Union[int, float, t.Callable[[], datetime.timedelta]]] = None,
 ) -> DecoratedView:
     """
     Decorator that protects endpoints through multiple mechanisms.
@@ -376,7 +376,7 @@ def auth_required(
             h = {}
             if "basic" in ams:
                 r = _security.default_http_auth_realm
-                h["WWW-Authenticate"] = 'Basic realm="%s"' % r
+                h["WWW-Authenticate"] = f'Basic realm="{r}"'
             mechanisms = [
                 (method, login_mechanisms.get(method))
                 for method in mechanisms_order
@@ -482,7 +482,9 @@ def roles_required(*roles: str) -> DecoratedView:
                     if _security._unauthorized_callback:
                         # Backwards compat - deprecated
                         return _security._unauthorized_callback()
-                    return _security._unauthz_handler(roles_required, list(roles))
+                    return _security._unauthz_handler(
+                        roles_required.__name__, list(roles)
+                    )
             return fn(*args, **kwargs)
 
         return decorated_view
@@ -514,7 +516,7 @@ def roles_accepted(*roles: str) -> DecoratedView:
             if _security._unauthorized_callback:
                 # Backwards compat - deprecated
                 return _security._unauthorized_callback()
-            return _security._unauthz_handler(roles_accepted, list(roles))
+            return _security._unauthz_handler(roles_accepted.__name__, list(roles))
 
         return decorated_view
 
@@ -550,7 +552,7 @@ def permissions_required(*fsperms: str) -> DecoratedView:
                         # Backwards compat - deprecated
                         return _security._unauthorized_callback()
                     return _security._unauthz_handler(
-                        permissions_required, list(fsperms)
+                        permissions_required.__name__, list(fsperms)
                     )
 
             return fn(*args, **kwargs)
@@ -588,7 +590,9 @@ def permissions_accepted(*fsperms: str) -> DecoratedView:
             if _security._unauthorized_callback:
                 # Backwards compat - deprecated
                 return _security._unauthorized_callback()
-            return _security._unauthz_handler(permissions_accepted, list(fsperms))
+            return _security._unauthz_handler(
+                permissions_accepted.__name__, list(fsperms)
+            )
 
         return decorated_view
 

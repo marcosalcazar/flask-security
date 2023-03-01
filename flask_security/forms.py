@@ -30,6 +30,7 @@ from wtforms import (
     validators,
 )
 
+from werkzeug.datastructures import MultiDict
 from wtforms.validators import Optional, StopValidation
 
 from .babel import is_lazy_string, make_lazy_string
@@ -44,6 +45,7 @@ from .utils import (
     get_message,
     hash_password,
     localize_callback,
+    suppress_form_csrf,
     url_for_security,
     validate_redirect_url,
     verify_password,
@@ -245,7 +247,7 @@ def unique_identity_attribute(form, field):
 
 class Form(BaseForm):
     def __init__(self, *args, **kwargs):
-        if current_app.testing:
+        if current_app and current_app.testing:
             self.TIME_LIMIT = None
         super().__init__(*args, **kwargs)
 
@@ -347,11 +349,21 @@ class CodeFormMixin:
     )
 
 
-register_username_field = StringField(
-    get_form_field_label("username"),
-    render_kw={"autocomplete": "username"},
-    validators=[username_validator, unique_username],
-)
+def get_register_username_field(app):
+    if cv("USERNAME_REQUIRED", app=app):
+        validators = [
+            Required(message="USERNAME_NOT_PROVIDED"),
+            username_validator,
+            unique_username,
+        ]
+    else:
+        validators = [username_validator, unique_username]
+    return StringField(
+        get_form_field_label("username"),
+        render_kw={"autocomplete": "username"},
+        validators=validators,
+    )
+
 
 login_username_field = StringField(
     get_form_field_label("username"),
@@ -395,15 +407,16 @@ class SendConfirmationForm(Form, UserEmailFormMixin):
 
     submit = SubmitField(get_form_field_label("send_confirmation"))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: t.Any, **kwargs: t.Any):
         super().__init__(*args, **kwargs)
-        self.user: "User" = None  # set by valid_user_email
-        if request.method == "GET":
+        self.user: t.Optional["User"] = None  # set by valid_user_email
+        if request and request.method == "GET":
             self.email.data = request.args.get("email", None)
 
     def validate(self, **kwargs: t.Any) -> bool:
         if not super().validate(**kwargs):
             return False
+        assert self.user is not None
         if self.user.confirmed_at is not None:
             self.email.errors.append(get_message("ALREADY_CONFIRMED")[0])
             return False
@@ -415,14 +428,15 @@ class ForgotPasswordForm(Form, UserEmailFormMixin):
 
     submit = SubmitField(get_form_field_label("recover_password"))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: t.Any, **kwargs: t.Any):
         super().__init__(*args, **kwargs)
-        self.requires_confirmation = False
-        self.user: "User" = None  # set by valid_user_email
+        self.requires_confirmation: bool = False
+        self.user: t.Optional["User"] = None  # set by valid_user_email
 
     def validate(self, **kwargs: t.Any) -> bool:
         if not super().validate(**kwargs):
             return False
+        assert self.user is not None
         if not self.user.is_active:
             self.email.errors.append(get_message("DISABLED_ACCOUNT")[0])
             return False
@@ -438,13 +452,14 @@ class PasswordlessLoginForm(Form, UserEmailFormMixin):
 
     submit = SubmitField(get_form_field_label("send_login_link"))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: t.Any, **kwargs: t.Any):
         super().__init__(*args, **kwargs)
-        self.user: "User" = None  # set by valid_user_email
+        self.user: t.Optional["User"] = None  # set by valid_user_email
 
     def validate(self, **kwargs: t.Any) -> bool:
         if not super().validate(**kwargs):
             return False
+        assert self.user is not None
         if not self.user.is_active:
             self.email.errors.append(get_message("DISABLED_ACCOUNT")[0])
             return False
@@ -467,20 +482,15 @@ class LoginForm(Form, PasswordFormMixin, NextFormMixin):
     remember = BooleanField(get_form_field_label("remember_me"))
     submit = SubmitField(get_form_field_label("login"))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: t.Any, **kwargs: t.Any):
         super().__init__(*args, **kwargs)
-        if not self.next.data:
+        if request and not self.next.data:
             self.next.data = request.args.get("next", "")
         self.remember.default = cv("DEFAULT_REMEMBER_ME")
-        if (
-            current_app.extensions["security"].recoverable
-            and not self.password.description
-        ):
+        if _security.recoverable and not self.password.description:
             html = Markup(
-                '<a href="{url}">{message}</a>'.format(
-                    url=url_for_security("forgot_password"),
-                    message=get_message("FORGOT_PASSWORD")[0],
-                )
+                f'<a href="{url_for_security("forgot_password")}">'
+                f'{get_message("FORGOT_PASSWORD")[0]}</a>'
             )
             self.password.description = html
         self.requires_confirmation: bool = False
@@ -559,9 +569,9 @@ class VerifyForm(Form, PasswordFormMixin):
 
     submit = SubmitField(get_form_field_label("verify_password"))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: t.Any, user: "User", **kwargs: t.Any):
         super().__init__(*args, **kwargs)
-        self.user: "User" = None  # set by view
+        self.user: "User" = user
 
     def validate(self, **kwargs: t.Any) -> bool:
         if not super().validate(**kwargs):  # pragma: no cover
@@ -631,7 +641,6 @@ class ConfirmRegisterForm(Form, RegisterFormMixin, UniqueEmailFormMixin):
 
 
 class RegisterForm(ConfirmRegisterForm, NextFormMixin):
-
     # Password optional when Unified Signin enabled.
     password_confirm = PasswordField(
         get_form_field_label("retype_password"),
@@ -780,13 +789,13 @@ class TwoFactorVerifyCodeForm(Form, CodeFormMixin):
 
     submit = SubmitField(get_form_field_label("submitcode"))
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: t.Any, **kwargs: t.Any):
         super().__init__(*args, **kwargs)
         # These are set by view.
         self.window: int = 0
         self.primary_method: str = ""
         self.tf_totp_secret: str = ""
-        self.user: "User" = None
+        self.user: t.Optional["User"] = None  # set by view
 
     def validate(self, **kwargs: t.Any) -> bool:
         if not super().validate(**kwargs):  # pragma: no cover
@@ -804,6 +813,7 @@ class TwoFactorVerifyCodeForm(Form, CodeFormMixin):
             return False
 
         # verify entered code with user's totp secret
+        assert self.user is not None
         if not _security._totp_factory.verify_totp(
             token=self.code.data,
             totp_secret=self.tf_totp_secret,
@@ -829,40 +839,29 @@ class TwoFactorRescueForm(Form):
     submit = SubmitField(get_form_field_label("submit"))
 
 
-class MfRecoveryCodesForm(Form):
-    """Generate and fetch recovery codes"""
+class DummyForm(Form):
+    """A dummy form for json responses"""
 
-    show_codes = SubmitField(get_form_field_xlate(_("Show Recovery Codes")))
-    generate_new_codes = SubmitField(
-        get_form_field_xlate(_("Generate New Recovery Codes"))
+    def __init__(self, *args: t.Any, **kwargs: t.Any):
+        super().__init__(*args, **kwargs)
+        self.user: t.Optional["User"] = kwargs.get("user", None)
+
+
+def build_form_from_request(form_name: str, **kwargs: t.Dict[str, t.Any]) -> Form:
+    # helper function for views
+    form_data = None
+    if request.content_length:
+        form_data = MultiDict(request.get_json()) if request.is_json else request.form
+    return build_form(
+        form_name, formdata=form_data, meta=suppress_form_csrf(), **kwargs
     )
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
-    def validate(self, **kwargs: t.Any) -> bool:
-        if not super().validate(**kwargs):  # pragma: no cover
-            return False
-        return True
-
-
-class MfRecoveryForm(Form):
-    code = StringField(
-        get_form_field_xlate(_("Recovery Code")),
-        validators=[Required()],
+def build_form(form_name, **kwargs):
+    # helper function for views
+    kwargs.setdefault("formdata", None)
+    return _security.forms[form_name].instantiator(
+        form_name,
+        _security.forms[form_name].cls,
+        **kwargs,
     )
-    submit = SubmitField(get_form_field_label("submitcode"))
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # filled by view
-        self.user: "User" = None
-
-    def validate(self, **kwargs: t.Any) -> bool:
-        if not super().validate(**kwargs):  # pragma: no cover
-            return False
-        codes = _datastore.mf_get_recovery_codes(self.user)
-        if self.code.data not in codes:
-            self.code.errors.append(get_message("INVALID_RECOVERY_CODE")[0])
-            return False
-        return True

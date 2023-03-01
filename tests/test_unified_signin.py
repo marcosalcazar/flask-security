@@ -25,8 +25,10 @@ from tests.test_utils import (
     authenticate,
     capture_flashes,
     capture_reset_password_requests,
+    get_form_action,
     logout,
     reset_fresh,
+    setup_tf_sms,
 )
 from tests.test_webauthn import HackWebauthnUtil, reg_2_keys
 
@@ -247,7 +249,6 @@ def test_simple_signin_json(app, client_nc, get_message):
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
     with capture_flashes() as flashes:
-
         response = client_nc.get("/us-signin", headers=headers)
         jresponse = response.json["response"]
         assert (
@@ -386,7 +387,7 @@ def test_us_passwordless(app, client, get_message):
         token = matcher[2].split(":")[1]
         assert token == requests[0]["token"]  # deprecated
         assert token == requests[0]["login_token"]
-        assert matcher[3].split(":")[1] == app.config["SECURITY_CONFIRM_URL"]
+        assert matcher[3].split(":")[1] == "True"  # register_blueprint
         assert matcher[4].split(":")[1] == "nopasswd-dude@lp.com"
 
         # check link
@@ -747,12 +748,8 @@ def test_setup(app, client, get_message):
     assert response.status_code == 200
     assert b"Submit Code" in response.data
     assert b"Enter code here to complete setup" in response.data
-    matcher = re.match(
-        r'.*<form action="([^\s]*)".*',
-        response.data.decode("utf-8"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    verify_url = matcher.group(1)
+
+    verify_url = get_form_action(response, 1)
 
     # Try invalid code
     response = client.post(verify_url, data=dict(passcode=12345), follow_redirects=True)
@@ -774,12 +771,7 @@ def test_setup_email(app, client, get_message):
     assert b"Enter code here to complete setup" in response.data
     outbox = app.mail.outbox
 
-    matcher = re.match(
-        r'.*<form action="([^\s]*)".*',
-        response.data.decode("utf-8"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    verify_url = matcher.group(1)
+    verify_url = get_form_action(response, 1)
 
     # verify no magic link - us_authenticate received first email - we want the second
     matcher = re.findall(r"\w+:.*", outbox[1].body, re.IGNORECASE)
@@ -1005,10 +997,7 @@ def test_verify(app, client, get_message):
     response = client.get("us-setup", follow_redirects=True)
     form_response = response.data.decode("utf-8")
     assert "Please Reauthenticate" in form_response
-    matcher = re.match(
-        r'.*formaction="([^"]*)".*', form_response, re.IGNORECASE | re.DOTALL
-    )
-    send_code_url = matcher.group(1)
+    send_code_url = get_form_action(response, 1)
 
     # Send unknown method
     response = client.post(
@@ -1237,12 +1226,7 @@ def test_qrcode(app, client, get_message):
     code = totp.generate().token
 
     # get verify link e.g. /us-setup/{state}
-    matcher = re.match(
-        r'.*<form action="([^\s]*)".*',
-        response.data.decode("utf-8"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    verify_url = matcher.group(1)
+    verify_url = get_form_action(response, 1)
 
     response = client.post(verify_url, data=dict(passcode=code), follow_redirects=True)
     assert response.status_code == 200
@@ -1581,12 +1565,7 @@ def test_tf_not(app, client, get_message):
     response = client.post(
         "us-setup", data=dict(chosen_method="sms", phone="650-555-1212")
     )
-    matcher = re.match(
-        r'.*<form action="([^\s]*)".*',
-        response.data.decode("utf-8"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    verify_url = matcher.group(1)
+    verify_url = get_form_action(response, 1)
     code = sms_sender.messages[0].split()[-1].strip(".")
     response = client.post(verify_url, data=dict(passcode=code), follow_redirects=True)
     assert response.status_code == 200
@@ -1659,6 +1638,8 @@ def test_bad_sender(app, client, get_message):
 
 @pytest.mark.registerable()
 def test_replace_send_code(app, get_message):
+    pytest.importorskip("sqlalchemy")
+
     from flask_sqlalchemy import SQLAlchemy
     from flask_security.models import fsqla_v2 as fsqla
     from flask_security import Security, us_send_security_token
@@ -2030,7 +2011,6 @@ def test_setup_delete_multi_json(app, client, get_message):
 
 @pytest.mark.settings(return_generic_responses=True)
 def test_generic_response(app, client, get_message):
-
     # test not-setup choice
     data = dict(identity="matt@lp.com", chosen_method="email")
     response = client.post("/us-signin/send-code", data=data, follow_redirects=True)
@@ -2115,3 +2095,48 @@ def test_generic_response(app, client, get_message):
         "us-verify-link?email=matt@lp.com&code=12345", follow_redirects=True
     )
     assert get_message("GENERIC_AUTHN_FAILED") in response.data
+
+
+@pytest.mark.settings(url_prefix="/auth", us_signin_replaces_login=True)
+def test_propagate_next(app, client):
+    # verify we propagate the ?next param all the way through a unified signin
+    # Also test blueprint prefix since we rarely actually test that.
+    set_phone(app)
+    with capture_send_code_requests() as codes:
+        response = client.get("profile", follow_redirects=True)
+        assert "?next=%2Fprofile" in response.request.url
+        signin_url = get_form_action(response, 0)
+        sendcode_url = get_form_action(response, 1)
+        response = client.post(
+            sendcode_url, data=dict(identity="matt@lp.com", chosen_method="sms")
+        )
+        data = dict(identity="matt@lp.com", passcode=codes[0]["login_token"])
+        response = client.post(signin_url, data=data, follow_redirects=False)
+        assert "/profile" in response.location
+
+
+@pytest.mark.two_factor()
+@pytest.mark.settings(url_prefix="/auth", us_signin_replaces_login=True)
+def test_propagate_next_tf(app, client):
+    # test next is propagated with a second factor
+    response = client.post(
+        "/auth/login", json=dict(identity="matt@lp.com", passcode="password")
+    )
+    sms_sender = setup_tf_sms(client, url_prefix=app.config["SECURITY_URL_PREFIX"])
+    logout(client, endpoint="/auth/logout")
+
+    response = client.get("/profile", follow_redirects=True)
+    assert "?next=%2Fprofile" in response.request.url
+    signin_url = get_form_action(response, 0)
+    response = client.post(
+        signin_url,
+        data=dict(identity="matt@lp.com", passcode="password"),
+        follow_redirects=True,
+    )
+    sendcode_url = get_form_action(response, 0)
+    response = client.post(
+        sendcode_url,
+        data=dict(code=sms_sender.messages[0].split()[-1]),
+        follow_redirects=True,
+    )
+    assert b"Profile Page" in response.data

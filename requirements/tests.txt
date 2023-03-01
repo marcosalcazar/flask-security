@@ -7,11 +7,13 @@ Flask-Principal
 peewee
 Flask-SQLAlchemy
 argon2_cffi
+authlib>=1.1.0
 bcrypt
 bleach
 check-manifest
 coverage
 cryptography
+djlint
 python-dateutil
 mongoengine
 mongomock
@@ -24,6 +26,8 @@ pytest-cache
 pytest-cov
 pytest
 qrcode
+# authlib requires requests
+requests
 sqlalchemy
 sqlalchemy-utils
 webauthn>=1.6.0;python_version>='3.8'

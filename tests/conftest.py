@@ -16,6 +16,8 @@ import typing as t
 from datetime import datetime
 from urllib.parse import urlsplit
 
+from passlib.ifc import PasswordHash
+from passlib.registry import register_crypt_handler
 import pytest
 from flask import Flask, Response, jsonify, render_template
 from flask import request as flask_request
@@ -59,6 +61,34 @@ if t.TYPE_CHECKING:  # pragma: no cover
     from flask.testing import FlaskClient
 
 
+class FastHash(PasswordHash):
+    """Our own 'hasher'. For testing
+    we want a fast hash, but a real one such that the provided password
+    and hash aren't the same (which is what happens when using plaintext).
+    """
+
+    name = "fasthash"
+    setting_kwds = ()
+    context_kwds = ()
+
+    @classmethod
+    def hash(cls, secret, **kwds):
+        return f"$fh$1${secret}"
+
+    @classmethod
+    def verify(cls, secret, stored_hash, **context_kwds):
+        new_hash = f"$fh$1${secret}"
+        return new_hash == stored_hash
+
+    @classmethod
+    def identify(cls, stored_hash):
+        return stored_hash.startswith("$fh$1$")
+
+    @classmethod
+    def using(cls, relaxed=False, **settings):
+        return type("fasthash2", (cls,), {})
+
+
 class SecurityFixture(Flask):
     security: Security
     mail: Mail
@@ -82,8 +112,11 @@ def app(request: pytest.FixtureRequest) -> "SecurityFixture":
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     app.config["SECURITY_PASSWORD_SALT"] = "salty"
-    # Make this plaintext for most tests - reduces unit test time by 50%
-    app.config["SECURITY_PASSWORD_HASH"] = "plaintext"
+    # Make this fasthash for most tests - reduces unit test time by 50%
+    app.config["SECURITY_PASSWORD_SCHEMES"] = ["fasthash", "argon2", "bcrypt"]
+    app.config["SECURITY_PASSWORD_HASH"] = "fasthash"
+    app.config["SECURITY_PASSWORD_SINGLE_HASH"] = True
+    register_crypt_handler(FastHash)
     # Make this hex_md5 for token tests
     app.config["SECURITY_HASHING_SCHEMES"] = ["hex_md5"]
     app.config["SECURITY_DEPRECATED_HASHING_SCHEMES"] = []
@@ -107,6 +140,14 @@ def app(request: pytest.FixtureRequest) -> "SecurityFixture":
     webauthn_test = marker_getter("webauthn")
     if webauthn_test is not None:
         pytest.importorskip("webauthn")
+
+    oauthlib_test = marker_getter("oauth")
+    if oauthlib_test is not None:
+        pytest.importorskip("authlib")
+
+    mfa_test = marker_getter("two_factor") or marker_getter("unified_signin")
+    if mfa_test is not None:
+        pytest.importorskip("cryptography")
 
     # Override config settings as requested for this test
     settings = marker_getter("settings")
@@ -242,12 +283,9 @@ def app(request: pytest.FixtureRequest) -> "SecurityFixture":
     def revert_forms():
         # Some forms/tests have dynamic fields - be sure to revert them.
         if hasattr(app, "security"):
-            if hasattr(app.security.login_form, "username"):
-                del app.security.login_form.username
-            if hasattr(app.security.register_form, "username"):
-                del app.security.register_form.username
-            if hasattr(app.security.confirm_register_form, "username"):
-                del app.security.confirm_register_form.username
+            for form_name in ["login_form", "register_form", "confirm_register_form"]:
+                if hasattr(app.security.forms[form_name].cls, "username"):
+                    del app.security.forms[form_name].cls.username
 
     request.addfinalizer(revert_forms)
     return app
@@ -377,6 +415,10 @@ def sqlalchemy_setup(request, app, tmpdir, realdburl):
     else:
         app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///:memory:"
 
+    # In Flask-SQLAlchemy >= 3.0.0 queries are no longer logged automatically,
+    # even in debug or testing mode.
+    app.config["SQLALCHEMY_RECORD_QUERIES"] = True
+
     db = SQLAlchemy(app)
 
     fsqla.FsModels.set_db_info(db)
@@ -400,8 +442,9 @@ def sqlalchemy_setup(request, app, tmpdir, realdburl):
 
     def tear_down():
         if realdburl:
-            db.drop_all()
-            _teardown_realdb(db_info)
+            with app.app_context():
+                db.drop_all()
+                _teardown_realdb(db_info)
 
     request.addfinalizer(tear_down)
 
@@ -419,8 +462,14 @@ def sqlalchemy_session_setup(request, app, tmpdir, realdburl):
     """
     pytest.importorskip("sqlalchemy")
     from sqlalchemy import create_engine
-    from sqlalchemy.orm import scoped_session, sessionmaker, relationship, backref
-    from sqlalchemy.ext.declarative import declarative_base, declared_attr
+    from sqlalchemy.orm import (
+        scoped_session,
+        sessionmaker,
+        relationship,
+        backref,
+        declarative_base,
+    )
+    from sqlalchemy.ext.declarative import declared_attr
     from sqlalchemy.ext.mutable import MutableList
     from sqlalchemy.sql import func
     from sqlalchemy import (
@@ -433,7 +482,7 @@ def sqlalchemy_session_setup(request, app, tmpdir, realdburl):
         Text,
         ForeignKey,
     )
-    from flask_security.models.fsqla_v3 import AsaList
+    from flask_security import AsaList
 
     f, path = tempfile.mkstemp(
         prefix="flask-security-test-db", suffix=".db", dir=str(tmpdir)
@@ -528,7 +577,9 @@ def sqlalchemy_session_setup(request, app, tmpdir, realdburl):
         active = Column(Boolean())
         confirmed_at = Column(DateTime())
         roles = relationship(
-            "Role", secondary="roles_users", backref=backref("users", lazy="dynamic")
+            "Role",
+            secondary="roles_users",
+            backref=backref("users", lazy="dynamic", cascade_backrefs=False),
         )
         update_datetime = Column(
             DateTime,
@@ -701,7 +752,6 @@ def pony_datastore(request, app, tmpdir, realdburl):
 
 
 def pony_setup(request, app, tmpdir, realdburl):
-
     pytest.importorskip("pony")
     from pony.orm import Database, Optional, Required, Set
     from pony.orm.core import SetInstance

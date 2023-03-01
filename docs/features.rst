@@ -94,7 +94,6 @@ at first use if null.
 
 Two-factor Authentication
 ----------------------------------------
-**This feature is in Beta - mostly due to it being brand new and little to no production soak time**
 
 Two-factor authentication is enabled by generating time-based one time passwords
 (Tokens). The tokens are generated using the users `totp secret`_, which is unique
@@ -111,7 +110,7 @@ Please read :ref:`2fa_theory_of_operation` for more details.
 The Two-factor feature offers the ability for a user to 'rescue' themselves if
 they lose track of their secondary factor device. Rescue options include sending
 a one time code via email, send an email to the application admin, and using a previously
-generated and downloaded one-time code.
+generated and downloaded one-time code (see :py:data:`SECURITY_MULTI_FACTOR_RECOVERY_CODES`).
 
 .. _unified-sign-in:
 
@@ -259,6 +258,7 @@ JSON is supported for the following operations:
 * Two-factor login requests
 * Change two-factor method requests
 * WebAuthn registration and signin requests
+* Two-Factor recovery code requests
 
 In addition, Single-Page-Applications (like those built with Vue, Angular, and
 React) are supported via customizable redirect links.
@@ -273,6 +273,24 @@ registered. They can be completely disabled or their names can be changed.
 Run ``flask --help`` and look for users and roles.
 
 
+Social/Oauth Authentication
+----------------------------
+Flask-Security provides a thin layer which integrates `authlib`_ with Flask-Security
+views and features (such as two-factor authentication). Flask-Security is shipped
+with support for github and google - others can be added by the application (see `loginpass`_
+for many examples).
+
+See :py:class:`flask_security.OAuthGlue`
+
+Please note - this is for authentication only, and the authenticating user must
+already be a registered user in your application. Once authenticated, all further
+authorization uses Flask-Security role/permission mechanisms.
+
+See `Flask OAuth Client <https://docs.authlib.org/en/latest/client/flask.html>`_
+for details. Note in particular, that you must setup and provide provider specific
+information - and most importantly - XX_CLIENT_ID and XX_CLIENT_SECRET should be
+specified as environment variables.
+
 .. _Click: https://palletsprojects.com/p/click/
 .. _Flask-Login: https://flask-login.readthedocs.org/en/latest/
 .. _Flask-WTF: https://flask-wtf.readthedocs.io/en/1.0.x/csrf/
@@ -285,3 +303,5 @@ Run ``flask --help`` and look for users and roles.
 .. _PyQRCode: https://pypi.python.org/pypi/PyQRCode/
 .. _Wikipedia: https://en.wikipedia.org/wiki/Multi-factor_authentication
 .. _Microsoft's: https://docs.microsoft.com/en-us/azure/active-directory/user-help/user-help-auth-app-overview
+.. _authlib: https://authlib.org/
+.. _loginpass: https://github.com/authlib/loginpass

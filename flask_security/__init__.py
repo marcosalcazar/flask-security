@@ -18,11 +18,13 @@ from .core import (
     UserMixin,
     WebAuthnMixin,
     AnonymousUser,
+    FormInfo,
     current_user,
 )
 from .datastore import (
     UserDatastore,
     SQLAlchemyUserDatastore,
+    AsaList,
     MongoEngineUserDatastore,
     PeeweeUserDatastore,
     PonyUserDatastore,
@@ -42,6 +44,7 @@ from .decorators import (
     unauth_csrf,
 )
 from .forms import (
+    Form,
     ChangePasswordForm,
     ForgotPasswordForm,
     LoginForm,
@@ -49,8 +52,6 @@ from .forms import (
     ResetPasswordForm,
     PasswordlessLoginForm,
     ConfirmRegisterForm,
-    MfRecoveryForm,
-    MfRecoveryCodesForm,
     SendConfirmationForm,
     TwoFactorRescueForm,
     TwoFactorSetupForm,
@@ -59,8 +60,14 @@ from .forms import (
     unique_identity_attribute,
 )
 from .mail_util import MailUtil
+from .oauth_glue import OAuthGlue
 from .password_util import PasswordUtil
 from .phone_util import PhoneUtil
+from .recovery_codes import (
+    MfRecoveryCodesUtil,
+    MfRecoveryForm,
+    MfRecoveryCodesForm,
+)
 from .signals import (
     confirm_instructions_sent,
     login_instructions_sent,
@@ -126,4 +133,4 @@ from .webauthn import (
 )
 from .webauthn_util import WebauthnUtil
 
-__version__ = "5.0.0"
+__version__ = "5.1.1"

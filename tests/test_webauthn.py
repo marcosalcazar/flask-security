@@ -22,17 +22,17 @@ import pytest
 from tests.test_two_factor import tf_in_session
 from tests.test_utils import (
     FakeSerializer,
-    SmsTestSender,
     authenticate,
     capture_flashes,
     get_existing_session,
+    get_form_action,
     json_authenticate,
     logout,
     reset_fresh,
+    setup_tf_sms,
 )
 
 from flask_security import (
-    SmsSenderFactory,
     WebauthnUtil,
     user_authenticated,
     wan_registered,
@@ -185,35 +185,15 @@ class HackWebauthnUtil(WebauthnUtil):
         return "http://localhost:5001"
 
 
-def setup_tf(client):
-    sms_sender = SmsSenderFactory.createSender("test")
-    data = dict(setup="sms", phone="+442083661188")
-    client.post("/tf-setup", json=data)
-    assert sms_sender.get_count() == 1
-    code = sms_sender.messages[0].split()[-1]
-    response = client.post("/tf-validate", json=dict(code=code))
-    assert response.status_code == 200
-    return sms_sender
-
-
-SmsSenderFactory.senders["test"] = SmsTestSender
-
-
-def _register_start(client, name="testr1", usage="secondary"):
-    response = client.post("wan-register", data=dict(name=name, usage=usage))
+def _register_start(client, name="testr1", usage="secondary", endpoint="wan-register"):
+    response = client.post(endpoint, data=dict(name=name, usage=usage))
     matcher = re.match(
         r".*handleRegister\(\'(.*)\'\).*",
         response.data.decode("utf-8"),
         re.IGNORECASE | re.DOTALL,
     )
     register_options = json.loads(matcher.group(1))
-
-    action_matcher = re.match(
-        r'.*<form action="([^\s]*)".*',
-        response.data.decode("utf-8"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    response_url = action_matcher.group(1)
+    response_url = get_form_action(response)
     return register_options, response_url
 
 
@@ -258,33 +238,30 @@ def _signin_start(
         re.IGNORECASE | re.DOTALL,
     )
     signin_options = json.loads(matcher.group(1))
-
-    action_matcher = re.match(
-        r'.*<form action="([^\s]*)".*',
-        response.data.decode("utf-8"),
-        re.IGNORECASE | re.DOTALL,
-    )
-    response_url = action_matcher.group(1)
+    response_url = get_form_action(response)
     return signin_options, response_url
 
 
-def _signin_start_json(client, identity=None, remember=False):
+def _signin_start_json(client, identity=None, remember=False, endpoint="wan-signin"):
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
     response = client.post(
-        "wan-signin", headers=headers, json=dict(identity=identity, remember=remember)
+        endpoint, headers=headers, json=dict(identity=identity, remember=remember)
     )
     signin_options = response.json["response"]["credential_options"]
     response_url = f'wan-signin/{response.json["response"]["wan_state"]}'
     return signin_options, response_url, response.json
 
 
-def wan_signin(client, identity, signin_data):
+def wan_signin(client, identity, signin_data, wan_signin_url):
     # perform complete sign in - useful for tests outside this module.
-    signin_options, response_url, _ = _signin_start_json(client, identity)
+    signin_options, response_url = _signin_start(
+        client, identity, endpoint=wan_signin_url
+    )
     response = client.post(
         response_url,
-        json=dict(credential=json.dumps(signin_data)),
+        data=dict(credential=json.dumps(signin_data)),
+        follow_redirects=True,
     )
     assert response.status_code == 200
     return response
@@ -796,7 +773,7 @@ def test_tf(app, client, get_message):
     assert response.status_code == 200
     assert b"Use Your WebAuthn Security Key as a Second Factor" in response.data
     # we should have a wan key available
-    assert b'action="/wan-signin"' in response.data
+    assert b'action="/wan-signin' in response.data
 
     # verify NOT logged in
     response = client.get("/profile", follow_redirects=False)
@@ -960,7 +937,6 @@ def test_tf_validity_window_json(app, client, get_message):
     webauthn_util_cls=HackWebauthnUtil, wan_register_within="1 seconds"
 )
 def test_register_timeout(app, client, get_message):
-
     authenticate(client)
 
     app.security.wan_serializer = FakeSerializer(1.0)
@@ -975,7 +951,6 @@ def test_register_timeout(app, client, get_message):
 
 @pytest.mark.settings(webauthn_util_cls=HackWebauthnUtil, wan_signin_within="2 seconds")
 def test_signin_timeout(app, client, get_message):
-
     authenticate(client)
 
     register_options, response_url = _register_start_json(client, name="testr3")
@@ -1116,7 +1091,7 @@ def test_alt_tf(app, client, get_message):
     response = client.post(response_url, json=dict(credential=json.dumps(REG_DATA1)))
     assert response.status_code == 200
 
-    sms_sender = setup_tf(client)
+    sms_sender = setup_tf_sms(client)
     logout(client)
 
     # sign in using webauthn key
@@ -1145,7 +1120,7 @@ def test_all_in_one(app, client, get_message):
     register_options, response_url = _register_start_json(client, usage="first")
     response = client.post(response_url, json=dict(credential=json.dumps(REG_DATA_UV)))
     assert response.status_code == 200
-    setup_tf(client)
+    setup_tf_sms(client)
 
     logout(client)
     signin_options, response_url, rjson = _signin_start_json(client, "matt@lp.com")
@@ -1168,7 +1143,7 @@ def test_all_in_one_not_allowed(app, client, get_message):
     register_options, response_url = _register_start_json(client, usage="first")
     response = client.post(response_url, json=dict(credential=json.dumps(REG_DATA_UV)))
     assert response.status_code == 200
-    setup_tf(client)
+    setup_tf_sms(client)
     logout(client)
 
     app.config["SECURITY_WAN_ALLOW_AS_MULTI_FACTOR"] = False
@@ -1648,3 +1623,36 @@ def test_mf(client):
     # verify actually logged in
     response = client.get("/profile", follow_redirects=False)
     assert response.status_code == 200
+
+
+@pytest.mark.settings(webauthn_util_cls=HackWebauthnUtil, url_prefix="/auth")
+def test_login_next(app, client, get_message):
+    # Test that ?next=/xx is propagated through login/wan-signin templates as well as
+    # views.
+    # Also - use a different blueprint prefix - we rarely test that....
+    authenticate(client, endpoint="/auth/login")
+    register_options, response_url = _register_start(
+        client, name="testr3", usage="first", endpoint="/auth/wan-register"
+    )
+    response = client.post(
+        response_url, data=dict(credential=json.dumps(REG_DATA1)), follow_redirects=True
+    )
+    assert response.status_code == 200
+    assert get_message("WEBAUTHN_REGISTER_SUCCESSFUL", name="testr3") in response.data
+    logout(client, endpoint="/auth/logout")
+
+    response = client.get("profile", follow_redirects=True)
+    assert "?next=%2Fprofile" in response.request.url
+    # pull webauthn form action out of login_form - should have ?next=...
+    webauthn_url = get_form_action(response, 1)
+
+    signin_options, response_url = _signin_start(
+        client, "matt@lp.com", endpoint=webauthn_url
+    )
+    response = client.post(
+        response_url,
+        data=dict(credential=json.dumps(SIGNIN_DATA1)),
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert b"Profile Page" in response.data

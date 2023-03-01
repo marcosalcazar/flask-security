@@ -90,8 +90,9 @@ Forms
 -----
 
 All forms can be overridden. For each form used, you can specify a
-replacement class. This allows you to add extra fields to the
-register form or override validators::
+replacement class. This allows you to add extra fields to any
+form or override validators. For example it is often desired to add additional
+personal information fields to the registration form::
 
     from flask_security import RegisterForm
     from wtforms import StringField
@@ -153,13 +154,52 @@ The following is a list of all the available form overrides:
     Changing/extending the form class won't directly change how it is displayed.
     You need to ALSO provide your own template and explicitly add the new fields you want displayed.
 
+.. _form_instantiation:
+
+Controlling Form Instantiation
+++++++++++++++++++++++++++++++
+This is an advanced concept! Please see :meth:`.Security.set_form_info` and
+:class:`.FormInfo`.
+
+This is an example of providing your own form instantiator using the 'form clone' pattern.
+In this example we are injecting an external `service` into the form for use in validation::
+
+    from flask_security import FormInfo
+
+    class MyLoginForm(LoginForm):
+        def __init__(self, *args, service=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.myservice = service
+
+        def instantiator(self, form_name, form_cls, *args, **kwargs):
+            return MyLoginForm(*args, service=self.myservice, **kwargs)
+
+        def validate(self, **kwargs: t.Any) -> bool:
+            if not super().validate(**kwargs):  # pragma: no cover
+                return False
+            if not self.myservice(self.email.data):
+                self.email.errors.append("Not happening")
+                return False
+            return True
+
+    # A silly service that only allows 'matt'' log in!
+    def login_checker(email):
+        return True if email == "matt@lp.com" else False
+
+    with app.test_request_context():
+        # Flask-WTForms require a request context.
+        fi = MyLoginForm(formdata=None, service=login_checker)
+    app.security.set_form_info("login_form", FormInfo(fi.instantiator))
+
 .. _custom_login_form:
 
 Customizing the Login Form
 ++++++++++++++++++++++++++
-This is an example of how to modify the registration and login form to add a username
-attribute (mimicking legacy Flask-Security behavior). Note that Flask-Security now has
-built-in support for username so this is unnecessary::
+This is an example of how to modify the registration and login form to add support for
+a single input field to accept both email and username (mimicking legacy Flask-Security behavior).
+Flask-Security supports username as a configuration option so this is not strictly needed
+any more, however, Flask-Security's LoginForm uses 2 different input fields (so that
+appropriate input attributes can be set)::
 
     from flask_security import (
             RegisterForm,
@@ -491,3 +531,24 @@ The decision on whether to return JSON is based on:
 
 
 .. _`this`: https://stackoverflow.com/questions/3297048/403-forbidden-vs-401-unauthorized-http-responses
+
+
+Redirects
+---------
+Flask-Security uses redirects frequently (when using forms), and most of the redirect
+destinations are configurable. When Flask-Security initiates a redirect it always (mostly) flashes a message
+that provides some context. In addition, Flask-Security - both in its views and default templates attempt to propagate
+any `next` query param and in fact, an existing `?next=/xx` will override most of the configuration redirect URLs.
+
+As a complex example consider an unauthenticated user accessing a `@auth_required` endpoint, and the user has
+two-factor authentication set up.:
+
+    * GET("/protected") - The `default_unauthn_handler` via Flask-Login will redirect to ``/login?next=/protected``
+    * The login form/template will pick any `?next=/xx` argument off the request URL and append it to form action.
+    * When the form is submitted if will do a POST("/login?next=/protected")
+    * Assuming correct authentication, the system will send out a 2-factor code and redirect to ``/tf-verify?next=/protected``
+    * The two_factor_validation_form/template also pulls any `?next=/xx` and appends to the form action.
+    * When the `tf-validate` form is submitted it will do a POST("/tf-validate?next=/protected").
+    * Assuming a correct code, the user is authenticated and is redirected. That redirection first
+      looks for a 'next' in the request.args then in request.form and finally will use the value of `SECURITY_POST_LOGIN_VIEW`.
+      In this example it will find the ``next=/protected`` in the request.args and redirect to ``/protected``.

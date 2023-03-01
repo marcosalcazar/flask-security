@@ -4,7 +4,7 @@
 
     two_factor tests
 
-    :copyright: (c) 2019-2022 by J. Christopher Wagner (jwag).
+    :copyright: (c) 2019-2023 by J. Christopher Wagner (jwag).
     :license: MIT, see LICENSE for more details.
 """
 
@@ -25,9 +25,10 @@ from tests.test_utils import (
     SmsTestSender,
     authenticate,
     capture_flashes,
+    capture_send_code_requests,
+    get_form_action,
     get_session,
     logout,
-    reset_fresh,
 )
 
 pytestmark = pytest.mark.two_factor()
@@ -263,7 +264,6 @@ def test_tf_reset_invalidates_cookie(app, client):
 
 @pytest.mark.settings(two_factor_required=True)
 def test_two_factor_two_factor_setup_anonymous(app, client, get_message):
-
     # trying to pick method without doing earlier stage
     data = dict(setup="email")
 
@@ -274,6 +274,35 @@ def test_two_factor_two_factor_setup_anonymous(app, client, get_message):
     assert flashes[0]["message"].encode("utf-8") == get_message(
         "TWO_FACTOR_PERMISSION_DENIED"
     )
+
+
+@pytest.mark.settings(two_factor_required=True, url_prefix="/api")
+def test_two_factor_illegal_state(app, client, get_message):
+    # trying to pick method without doing earlier stage
+    data = dict(setup="email")
+
+    with capture_flashes() as flashes:
+        response = client.post("/api/tf-setup", data=data)
+        assert response.status_code == 302
+        assert "/api/login" in response.location
+    assert flashes[0]["category"] == "error"
+    assert flashes[0]["message"].encode("utf-8") == get_message(
+        "TWO_FACTOR_PERMISSION_DENIED"
+    )
+
+    # try validate code
+    response = client.post(
+        "/api/tf-validate", data=dict(code=b"333"), follow_redirects=False
+    )
+    assert response.status_code == 302
+    assert "/api/login" in response.location
+
+    # try rescue
+    response = client.post(
+        "/api/tf-rescue", data=dict(help_setup="lost_device"), follow_redirects=False
+    )
+    assert response.status_code == 302
+    assert "/api/login" in response.location
 
 
 @pytest.mark.settings(two_factor_required=True)
@@ -691,6 +720,7 @@ def test_no_opt_out(app, client, get_message):
 
     response = client.get("/tf-setup", follow_redirects=True)
     assert b"Disable two factor" not in response.data
+    assert b"Currently setup two-factor method: sms" in response.data
 
     # Try to opt-out
     data = dict(setup="disable")
@@ -768,6 +798,7 @@ def test_opt_in(app, client, get_message):
     # Validate token - this should complete 2FA setup
     response = client.post("/tf-validate", data=dict(code=code), follow_redirects=True)
     assert b"You successfully changed" in response.data
+    assert response.history[0].location == "/tf-setup"
 
     # Upon completion, session cookie shouldnt have any two factor stuff in it.
     session = get_session(response)
@@ -1161,6 +1192,8 @@ def test_bad_sender(app, client, get_message):
 
 
 def test_replace_send_code(app, get_message):
+    pytest.importorskip("sqlalchemy")
+
     # replace tf_send_code - and have it return an error to check that.
     from flask_sqlalchemy import SQLAlchemy
     from flask_security.models import fsqla_v2 as fsqla
@@ -1213,6 +1246,20 @@ def test_replace_send_code(app, get_message):
         )
 
 
+def test_propagate_next(app, client):
+    # verify we propagate the ?next param all the way through a two-factor login
+    with capture_send_code_requests() as codes:
+        data = dict(email="gal@lp.com", password="password")
+        response = client.post("/login?next=/im-in", data=data, follow_redirects=True)
+        assert "?next=%2Fim-in" in response.request.url
+        # grab URL from form to show that our template propagates ?next
+        verify_url = get_form_action(response)
+        response = client.post(
+            verify_url, data=dict(code=codes[0]["login_token"]), follow_redirects=False
+        )
+        assert "/im-in" in response.location
+
+
 @pytest.mark.settings(freshness=timedelta(minutes=0))
 def test_verify(app, client, get_message):
     # Test setup when re-authenticate required
@@ -1225,12 +1272,8 @@ def test_verify(app, client, get_message):
     # This call should require re-verify
     authenticate(client)
     response = client.get("tf-setup", follow_redirects=True)
-    form_response = response.data.decode("utf-8")
     assert get_message("REAUTHENTICATION_REQUIRED") in response.data
-    matcher = re.match(
-        r'.*form action="([^"]*)".*', form_response, re.IGNORECASE | re.DOTALL
-    )
-    verify_password_url = matcher.group(1)
+    verify_password_url = get_form_action(response)
 
     # Send wrong password
     response = client.post(
@@ -1290,6 +1333,8 @@ def test_setup_nofresh(app, client, get_message):
 
 @pytest.mark.settings(two_factor_enabled_methods=["email"])
 def test_no_sms(app, get_message):
+    pytest.importorskip("sqlalchemy")
+
     # Make sure that don't require tf_phone_number if SMS isn't an option.
     from sqlalchemy import (
         Boolean,
@@ -1359,188 +1404,17 @@ def test_no_sms(app, get_message):
         assert b"You successfully changed your two-factor method" in response.data
 
 
-@pytest.mark.settings(multi_factor_recovery_codes=True)
-def test_rc_json(app, client, get_message):
-    # Test recovery codes
-    # gal has two-factor already setup for 'sms'
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    tf_authenticate(app, client)
+@pytest.mark.settings(two_factor_post_setup_view="/post_setup_view")
+def test_post_setup_redirect(app, client):
+    authenticate(client, "jill@lp.com")
 
-    response = client.get("/mf-recovery-codes", headers=headers)
-    assert response.status_code == 200
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 0
+    sms_sender = SmsSenderFactory.createSender("test")
+    data = dict(setup="sms", phone="+442083661177")
+    response = client.post("/tf-setup", data=data, follow_redirects=True)
+    assert b"To Which Phone Number Should We Send Code To" in response.data
+    assert sms_sender.get_count() == 1
+    code = sms_sender.messages[0].split()[-1]
 
-    response = client.post("/mf-recovery-codes", headers=headers)
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 5
-
-    response = client.get("/mf-recovery-codes", headers=headers)
-    recodes = response.json["response"]["recovery_codes"]
-    assert len(recodes) == 5 and codes[0] == recodes[0]
-
-    response = client.get("/mf-recovery-codes", headers=headers)
-    assert response.status_code == 200
-    assert not hasattr(response.json["response"], "recovery_codes")
-
-    # endpoint is for unauthenticated only
-    response = client.post("/mf-recovery", json=dict(code=codes[0]))
-    assert response.status_code == 400
-    logout(client)
-
-    response = client.post("/login", json=dict(email="gal@lp.com", password="password"))
-    assert response.json["response"]["tf_required"]
-
-    response = client.post("/mf-recovery", json=dict(code=codes[0]))
-    assert response.status_code == 200
-
-    # verify actually logged in
-    response = client.get("/profile", follow_redirects=False)
-    assert response.status_code == 200
-
-    # logout and try again - first code shouldn't work again
-    logout(client)
-    response = client.post("/login", json=dict(email="gal@lp.com", password="password"))
-    assert response.json["response"]["tf_required"]
-
-    response = client.post("/mf-recovery", json=dict(code=codes[0]))
-    assert response.status_code == 400
-    assert response.json["response"]["errors"][0].encode("utf-8") == get_message(
-        "INVALID_RECOVERY_CODE"
-    )
-    response = client.post("/mf-recovery", json=dict(code=codes[1]))
-    assert response.status_code == 200
-
-
-@pytest.mark.settings(multi_factor_recovery_codes=True)
-def test_rc(app, client, get_message):
-    # Test recovery codes
-    # gal has two-factor already setup for 'sms'
-    tf_authenticate(app, client)
-
-    response = client.post("/mf-recovery-codes")
-    rd = response.data.decode("utf-8")
-    codes = re.findall(r"[a-f,\d]{4}-[a-f,\d]{4}-[a-f,\d]{4}", rd)
-    assert len(codes) == 5
-
-    response = client.get("/mf-recovery-codes?show_codes=hi")
-    assert response.status_code == 200
-    assert b"Recovery Codes" in response.data
-    rd = response.data.decode("utf-8")
-    codes = re.findall(r"[a-f,\d]{4}-[a-f,\d]{4}-[a-f,\d]{4}", rd)
-    assert len(codes) == 5
-
-    # endpoint is for unauthenticated only
-    response = client.post(
-        "/mf-recovery", data=dict(code=codes[0]), follow_redirects=False
-    )
-    assert response.status_code == 302
-    logout(client)
-
-    response = client.post("/login", json=dict(email="gal@lp.com", password="password"))
-    assert response.json["response"]["tf_required"]
-
-    response = client.post(
-        "/mf-recovery", data=dict(code=codes[0]), follow_redirects=True
-    )
-    assert response.status_code == 200
-
-    # verify actually logged in
-    response = client.get("/profile", follow_redirects=False)
-    assert response.status_code == 200
-
-    # logout and try again - first code shouldn't work again
-    logout(client)
-    response = client.post("/login", data=dict(email="gal@lp.com", password="password"))
-
-    response = client.post("/mf-recovery", data=dict(code=codes[0]))
-    assert get_message("INVALID_RECOVERY_CODE") in response.data
-    response = client.post(
-        "/mf-recovery", data=dict(code=codes[1]), follow_redirects=True
-    )
-    assert response.status_code == 200
-    # verify actually logged in
-    response = client.get("/profile", follow_redirects=False)
-    assert response.status_code == 200
-
-
-@pytest.mark.settings(multi_factor_recovery_codes=True)
-def test_rc_reset(app, client, get_message):
-    # test that reset_user_access, removes recovery codes
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    tf_authenticate(app, client)
-
-    response = client.post("/mf-recovery-codes", headers=headers)
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 5
-
-    with app.app_context():
-        user = app.security.datastore.find_user(email="gal@lp.com")
-        app.security.datastore.reset_user_access(user)
-        app.security.datastore.commit()
-
-    client.post("/login", json=dict(email="gal@lp.com", password="password"))
-    response = client.get("/mf-recovery-codes", headers=headers)
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 0
-
-
-@pytest.mark.settings(multi_factor_recovery_codes=True)
-def test_rc_bad_state(app, client, get_message):
-
-    response = client.post("/mf-recovery", json=dict(code="hi"))
-    assert response.status_code == 400
-    assert response.json["response"]["errors"][0].encode("utf=8") == get_message(
-        "TWO_FACTOR_PERMISSION_DENIED"
-    )
-
-
-@pytest.mark.settings(multi_factor_recovery_codes=True)
-def test_rc_rescue(app, client, get_message):
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    tf_authenticate(app, client)
-
-    response = client.post("/mf-recovery-codes", headers=headers)
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 5
-    logout(client)
-
-    data = dict(email="gal@lp.com", password="password")
-    response = client.post("/login", json=data)
-    assert response.json["response"]["tf_required"]
-
-    response = client.get("/tf-rescue")
-    assert b"Use previously downloaded recovery code" in response.data
-
-    response = client.get("/tf-rescue", headers=headers)
-    options = response.json["response"]["recovery_options"]
-    assert "recovery_code" in options.keys()
-    assert "/mf-recovery" in options["recovery_code"]
-
-    response = client.post(
-        "/tf-rescue", data=dict(help_setup="recovery_code"), follow_redirects=False
-    )
-    assert "/mf-recovery" in response.location
-
-
-@pytest.mark.settings(multi_factor_recovery_codes=True)
-def test_fresh(app, client):
-    # Make sure fetching recovery codes is protected with a freshness check.
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-
-    authenticate(client)
-    response = client.post("/mf-recovery-codes", headers=headers)
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 5
-
-    reset_fresh(client, app.config["SECURITY_FRESHNESS"])
-    response = client.post("/mf-recovery-codes", headers=headers)
-    assert response.status_code == 401
-    assert response.json["response"]["reauth_required"]
-
-    response = client.post("/verify", json=dict(password="password"))
-    assert response.status_code == 200
-
-    response = client.post("/mf-recovery-codes", headers=headers)
-    codes = response.json["response"]["recovery_codes"]
-    assert len(codes) == 5
+    # Validate token - this should complete 2FA setup
+    response = client.post("/tf-validate", data=dict(code=code), follow_redirects=False)
+    assert response.location == "/post_setup_view"

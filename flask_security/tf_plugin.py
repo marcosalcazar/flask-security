@@ -13,10 +13,10 @@
 import typing as t
 
 from flask import request, redirect, session
-from werkzeug.datastructures import MultiDict
 
 from .decorators import unauth_csrf
 from .forms import (
+    build_form_from_request,
     get_form_field_xlate,
     Form,
     RadioField,
@@ -33,8 +33,8 @@ from .utils import (
     get_within_delta,
     get_url,
     login_user,
+    propagate_next,
     simple_render_json,
-    suppress_form_csrf,
     url_for_security,
 )
 
@@ -58,23 +58,19 @@ class TwoFactorSelectForm(Form):
 def tf_select() -> "ResponseValue":
     # Ask user which MFA method they want to use.
     # This is used when a user has setup more than one type of 2FA.
-    form_class = _security.two_factor_select_form
-    form_data = None
-    if request.content_length:
-        form_data = MultiDict(request.get_json()) if request.is_json else request.form
-    form = form_class(formdata=form_data, meta=suppress_form_csrf())
+    form = build_form_from_request("two_factor_select_form")
 
     # This endpoint is unauthenticated - make sure we're in a valid state
     if not all(k in session for k in ["tf_user_id", "tf_select"]):
         # illegal call on this endpoint
         tf_clean_session()
-        return tf_illegal_state(form, _security.login_url)
+        return tf_illegal_state(form, cv("TWO_FACTOR_ERROR_VIEW"))
 
     user = _datastore.find_user(fs_uniquifier=session["tf_user_id"])
     if not user:  # pragma no cover
         # hard to imagine - someone deletes the user while they are logging in.
         tf_clean_session()
-        return tf_illegal_state(form, _security.login_url)
+        return tf_illegal_state(form, cv("TWO_FACTOR_ERROR_VIEW"))
 
     setup_methods = _security.two_factor_plugins.get_setup_tf_methods(user)
     form.which.choices = setup_methods
@@ -84,13 +80,15 @@ def tf_select() -> "ResponseValue":
         tf_impl = _security.two_factor_plugins.method_to_impl(user, form.which.data)
         if tf_impl:
             json_payload = {"tf_required": True}
-            response = tf_impl.tf_login(user, json_payload)
+            response = tf_impl.tf_login(
+                user, json_payload, next_loc=propagate_next(request.url)
+            )
         if not response:  # pragma no cover
             # This really can't happen unless between the time the started logging in
             # and now, they deleted a second factor (which they would have to do
             # in another window).
             tf_clean_session()
-            return tf_illegal_state(form, _security.login_url)
+            return tf_illegal_state(form, cv("TWO_FACTOR_ERROR_VIEW"))
         return response
 
     if _security._want_json(request):
@@ -120,14 +118,14 @@ class TfPluginBase:  # pragma no cover
         raise NotImplementedError
 
     def tf_login(
-        self, user: "User", json_payload: t.Dict[str, t.Any]
+        self, user: "User", json_payload: t.Dict[str, t.Any], next_loc: t.Optional[str]
     ) -> "ResponseValue":
         """
         Called from first/primary authenticated views if the user successfully
         authenticated, and required a second method of authentication.
         This method returns the necessary information for the user UI to continue.
         For forms, this is usually a redirect to a secondary sign in form. For JSON
-        it is just a payload that describes that the user has to do next.
+        it is just a payload that describes what the user has to do next.
         """
         raise NotImplementedError
 
@@ -140,7 +138,7 @@ class TfPlugin:
     app. See TfPluginBase for what a new implementation must provide.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._tf_impls: t.Dict[str, "TfPluginBase"] = {}
 
     def register_tf_impl(
@@ -184,7 +182,11 @@ class TfPlugin:
         return methods
 
     def tf_enter(
-        self, user: "User", remember_me: bool, primary_authn_via: str
+        self,
+        user: "User",
+        remember_me: bool,
+        primary_authn_via: str,
+        next_loc: t.Optional[str],
     ) -> t.Optional["ResponseValue"]:
         """Check if two-factor is required and if so, start the process.
         Must be called in a request context.
@@ -211,7 +213,9 @@ class TfPlugin:
                     # as part of initial login.
                     if len(tf_setup_methods) == 0:
                         # only initial two-factor implementation supports this
-                        return self._tf_impls["code"].tf_login(user, json_payload)
+                        return self._tf_impls["code"].tf_login(
+                            user, json_payload, next_loc
+                        )
                     elif len(tf_setup_methods) == 1:
                         # method_to_impl can't return None here since we just
                         # got the methods up above.
@@ -219,11 +223,12 @@ class TfPlugin:
                             TfPluginBase,
                             self.method_to_impl(user, t.cast(str, tf_setup_methods[0])),
                         )
-                        return impl.tf_login(user, json_payload)
+                        return impl.tf_login(user, json_payload, next_loc)
                     else:
                         session["tf_select"] = True
                         if not _security._want_json(request):
-                            return redirect(url_for_security("tf_select"))
+                            values = dict(next=next_loc) if next_loc else dict()
+                            return redirect(url_for_security("tf_select", **values))
                         # Let's force app to go through tf-select just in case we want
                         # to do further validation... However, provide the choices
                         # so they can just do a POST
@@ -344,13 +349,3 @@ def tf_clean_session():
             "tf_select",
         ]:
             session.pop(k, None)
-
-
-def create_recovery_codes(user: "User") -> t.List[str]:
-    # Create new recovery codes and store in user record.
-    # TODO - if app provides a key - use cryptography.fernet to encrypt into DB
-    new_codes = _security._totp_factory.generate_recovery_codes(
-        cv("MULTI_FACTOR_RECOVERY_CODES_N")
-    )
-    _datastore.mf_set_recovery_codes(user, new_codes)
-    return new_codes

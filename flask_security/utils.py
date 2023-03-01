@@ -42,7 +42,6 @@ from wtforms import ValidationError
 from itsdangerous import BadSignature, SignatureExpired
 from werkzeug import __version__ as werkzeug_version
 from werkzeug.local import LocalProxy
-from werkzeug.datastructures import MultiDict
 
 from .quart_compat import best, get_quart_status
 from .proxies import _security, _datastore, _pwd_context, _hashing_context
@@ -114,7 +113,9 @@ def find_csrf_field_name():
     overridable.
     We take the field name from the login_form as set by the configuration.
     """
-    form = _security.login_form(MultiDict([]))
+    from .forms import DummyForm
+
+    form = DummyForm(formdata=None)
     if hasattr(form.meta, "csrf_field_name"):
         return form.meta.csrf_field_name
     return None
@@ -423,9 +424,7 @@ def do_flash(message: str, category: str) -> None:
         flash(message, category)
 
 
-def get_url(
-    endpoint_or_url: t.Optional[str], qparams: t.Optional[t.Dict[str, str]] = None
-) -> t.Optional[str]:
+def get_url(endpoint_or_url: str, qparams: t.Optional[t.Dict[str, str]] = None) -> str:
     """Returns a URL if a valid endpoint is found. Otherwise, returns the
     provided value.
 
@@ -433,13 +432,12 @@ def get_url(
     :param qparams: additional query params to add to end of url
     :return: URL
     """
-    if not endpoint_or_url:
-        return endpoint_or_url
     try:
         return transform_url(url_for(endpoint_or_url), qparams)
     except Exception:
         # This is an external URL (no endpoint defined in app)
         # For (mostly) testing - allow changing/adding the url - for example
+        # add a different host:port for cases where the UI is running
         # add a different host:port for cases where the UI is running
         # separately.
         if config_value("REDIRECT_HOST"):
@@ -456,13 +454,12 @@ def slash_url_suffix(url, suffix):
     """Adds a slash either to the beginning or the end of a suffix
     (which is to be appended to a URL), depending on whether or not
     the URL ends with a slash."""
-
-    return url.endswith("/") and ("%s/" % suffix) or ("/%s" % suffix)
+    return url.endswith("/") and f"{suffix}/" or f"/{suffix}"
 
 
 def transform_url(
-    url: t.Optional[str], qparams: t.Optional[t.Dict[str, str]] = None, **kwargs: str
-) -> t.Optional[str]:
+    url: str, qparams: t.Optional[t.Dict[str, str]] = None, **kwargs: str
+) -> str:
     """Modify url
 
     :param url: url to transform (can be relative)
@@ -472,8 +469,6 @@ def transform_url(
 
     .. versionadded:: 3.2.0
     """
-    if not url:
-        return url
     link_parse = urlsplit(url)
     if qparams:
         current_query = dict(parse_qsl(link_parse.query))
@@ -486,7 +481,7 @@ def get_security_endpoint_name(endpoint):
     return f"{_security.blueprint_name}.{endpoint}"
 
 
-def url_for_security(endpoint: str, **values: t.Union[str, bool]) -> str:
+def url_for_security(endpoint: str, **values: t.Any) -> str:
     """Return a URL for the security blueprint
 
     :param endpoint: the endpoint of the URL (name of the function)
@@ -557,9 +552,18 @@ def validate_redirect_url(url: str) -> bool:
 
 
 def get_post_action_redirect(config_key: str, declared: t.Optional[str] = None) -> str:
+    # All this nonsense due to mypy
+    arg_next_url = None
+    arg_next = request.args.get("next", None)
+    if arg_next:
+        arg_next_url = get_url(arg_next)
+    form_next_url = None
+    form_next = request.form.get("next", None)
+    if form_next:
+        form_next_url = get_url(form_next)
     urls = [
-        get_url(request.args.get("next", None)),
-        get_url(request.form.get("next", None)),
+        arg_next_url,
+        form_next_url,
         find_redirect(config_key),
     ]
     if declared:
@@ -591,11 +595,15 @@ def find_redirect(key: str) -> t.Optional[str]:
 
     :param key: The session or application configuration key to search for
     """
-    rv = (
-        get_url(session.pop(key.lower(), None))
-        or get_url(current_app.config[key.upper()] or None)
-        or current_app.config.get("APPLICATION_ROOT", "/")
-    )
+    session_value = session.pop(key.lower(), None)
+    session_url = None
+    if session_value:
+        session_url = get_url(session_value)
+    app_value = current_app.config[key.upper()]
+    app_url = None
+    if app_value:
+        app_url = get_url(app_value)
+    rv = session_url or app_url or current_app.config.get("APPLICATION_ROOT", "/")
     return rv
 
 
@@ -687,11 +695,11 @@ def send_mail(subject, recipient, template, **context):
 
     body = None
     html = None
-    ctx = ("security/email", template)
+    template_path = f"security/email/{template}"
     if config_value("EMAIL_PLAINTEXT"):
-        body = _security.render_template("%s/%s.txt" % ctx, **context)
+        body = _security.render_template(f"{template_path}.txt", **context)
     if config_value("EMAIL_HTML"):
-        html = _security.render_template("%s/%s.html" % ctx, **context)
+        html = _security.render_template(f"{template_path}.html", **context)
 
     subject = localize_callback(subject)
 
@@ -700,7 +708,13 @@ def send_mail(subject, recipient, template, **context):
         sender = sender._get_current_object()
 
     _security._mail_util.send_mail(
-        template, subject, recipient, sender, body, html, context.get("user", None)
+        template,
+        subject,
+        recipient,
+        sender,
+        body,
+        html,
+        **context,
     )
 
 
@@ -719,6 +733,7 @@ def get_token_status(token, serializer, max_age=None, return_data=False):
     warnings.warn(
         "'get_token_status' is deprecated - use check_and_get_token_status instead",
         DeprecationWarning,
+        stacklevel=2,
     )
     serializer = getattr(_security, serializer + "_serializer")
     max_age = get_max_age(max_age)
@@ -1033,8 +1048,8 @@ def json_error_response(
     """Helper to create an error response.
 
     The "errors" key holds a simple list of errors - which is made up of any passed
-    errors (either a string or list) as well as the (localized) error msg from the
-    passed in form errors.
+    errors (either a string or list) as well as the (localized) error msgs from the
+    passed in field_errors.
 
     The "field_errors" key which is exactly what is returned from WTForms - namely
     a dict of field-name: msg. For form-level errors (WTForms 3.0) the 'field-name' is
@@ -1065,9 +1080,6 @@ def default_render_template(*args, **kwargs):
 
 
 class SmsSenderBaseClass(metaclass=abc.ABCMeta):
-    def __init__(self, *args, **kwargs):
-        pass
-
     @abc.abstractmethod
     def send_sms(
         self, from_number: str, to_number: str, msg: str
